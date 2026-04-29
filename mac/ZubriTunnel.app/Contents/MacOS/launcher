@@ -30,7 +30,9 @@ if [ -n "$BUNDLED" ] && [ -x "$BUNDLED" ]; then
     fi
 fi
 
-# Поиск рабочего Python (с проверкой что tkinter импортируется)
+# Поиск рабочего Python — проверяем НЕ просто 'import tkinter', а реальное
+# создание Tk()-окна. Apple-овский /usr/bin/python3 на минор-несовпадении
+# macOS-сборки импорт проходит, но Tk() падает с 'macOS 15 (1507) required'.
 find_working_python() {
     local candidates=(
         /opt/homebrew/bin/python3
@@ -47,10 +49,11 @@ find_working_python() {
         "$(command -v python3 2>/dev/null)"
         /usr/bin/python3
     )
+    local probe='import tkinter; r = tkinter.Tk(); r.withdraw(); r.destroy()'
     for p in "${candidates[@]}"; do
         [ -z "$p" ] && continue
         [ -x "$p" ] || continue
-        if "$p" -c "import tkinter" >/dev/null 2>&1; then
+        if "$p" -c "$probe" >/dev/null 2>&1; then
             echo "$p"
             return 0
         fi
