@@ -1,40 +1,19 @@
 #!/usr/bin/env bash
-# Лаунчер ZubriTunnel.app — диагностический режим: лог + auto-bundle.
+# Лаунчер ZubriTunnel.app
+# Все source-файлы внутри bundle (.app/Contents/Resources/) — TCC sandbox их не блокирует.
 
 LOG="$HOME/Library/Logs/ZubriTunnel.log"
 mkdir -p "$(dirname "$LOG")"
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-RES="$(cd "$HERE/../Resources" 2>/dev/null && pwd)"
-SIBLING="$(cd "$HERE/../../.." 2>/dev/null && pwd)"
+RES="$(cd "$HERE/../Resources" && pwd)"
 
-# Если в .app/Resources/ нет gui.py, но он есть в sibling mac/ — копируем внутрь
-# (так .app становится self-contained и обходит TCC-ограничения Documents/Desktop)
-if [ -n "$RES" ] && [ ! -f "$RES/gui.py" ] && [ -f "$SIBLING/gui.py" ]; then
-    {
-        echo "=== $(date) auto-bundle ==="
-        echo "copying source from $SIBLING into $RES"
-        cp -f "$SIBLING/gui.py" "$RES/" 2>&1
-        cp -f "$SIBLING/main.go" "$RES/" 2>&1
-        cp -f "$SIBLING/go.mod" "$RES/" 2>&1
-        cp -f "$SIBLING/go.sum" "$RES/" 2>&1
-        cp -f "$SIBLING/icon.png" "$RES/" 2>&1
-        mkdir -p "$RES/keys"
-        cp -f "$SIBLING/keys/example.json.template" "$RES/keys/" 2>&1 || true
-    } >> "$LOG" 2>&1
-fi
-
-# Выбор рабочей папки: Resources/ предпочтительно (внутри .app, без TCC)
-if [ -n "$RES" ] && [ -f "$RES/gui.py" ]; then
-    WORKDIR="$RES"
-elif [ -n "$SIBLING" ] && [ -f "$SIBLING/gui.py" ]; then
-    WORKDIR="$SIBLING"
-else
-    osascript -e 'display alert "ZubriTunnel" message "Не нашёл gui.py.\n\nЕсли скачивал релиз, скачай заново. Если git clone — выполни в Terminal:\n\ncd <папка проекта>\ncp mac/{gui.py,main.go,go.mod,go.sum,icon.png} mac/ZubriTunnel.app/Contents/Resources/"'
+if [ ! -f "$RES/gui.py" ]; then
+    osascript -e 'display alert "ZubriTunnel" message "Не нашёл gui.py внутри bundle. Скачай свежий релиз: github.com/AntonZubritski/ZubriTunnel/releases"'
     exit 1
 fi
 
-cd "$WORKDIR"
+cd "$RES"
 
 # Найти python3
 PY="$(command -v python3 2>/dev/null)"
@@ -48,18 +27,16 @@ if [ -z "$PY" ]; then
     exit 1
 fi
 
-# Запуск с захватом stdout+stderr
 {
     echo ""
     echo "=== $(date) ==="
-    echo "workdir: $WORKDIR"
+    echo "workdir: $RES"
     echo "python:  $PY ($($PY --version 2>&1))"
     echo ""
     "$PY" gui.py
 } >> "$LOG" 2>&1
 
 EXIT_CODE=$?
-
 if [ "$EXIT_CODE" -ne 0 ]; then
     LAST="$(tail -25 "$LOG" | sed 's/"/\\"/g; s/$/\\n/g' | tr -d '\n' | head -c 1500)"
     osascript -e "display alert \"ZubriTunnel: ошибка запуска (код $EXIT_CODE)\" message \"Полный лог: ~/Library/Logs/ZubriTunnel.log\n\n$LAST\""

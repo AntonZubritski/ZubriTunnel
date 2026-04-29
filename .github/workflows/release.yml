@@ -57,24 +57,20 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: '1.22'
-          cache-dependency-path: mac/go.sum
+          cache-dependency-path: mac/ZubriTunnel.app/Contents/Resources/go.sum
 
-      - name: Build mac/vpn-proxy binary
-        working-directory: mac
-        run: go build -o vpn-proxy .
-
-      - name: Bundle source into ZubriTunnel.app/Contents/Resources (self-contained)
+      - name: Build vpn-proxy binary inside bundle
         run: |
           RES="mac/ZubriTunnel.app/Contents/Resources"
-          mkdir -p "$RES/keys"
-          cp mac/gui.py mac/main.go mac/go.mod mac/go.sum mac/icon.png "$RES/"
-          cp mac/keys/example.json.template "$RES/keys/" 2>/dev/null || true
-          ls -la "$RES"
+          BIN="mac/ZubriTunnel.app/Contents/MacOS/vpn-proxy"
+          (cd "$RES" && go build -o "../MacOS/vpn-proxy" .)
+          ls -la "mac/ZubriTunnel.app/Contents/MacOS"
 
       - name: Make scripts executable
         run: |
           chmod +x mac/run.sh mac/gui.command
           chmod +x "mac/ZubriTunnel.app/Contents/MacOS/launcher"
+          chmod +x "mac/ZubriTunnel.app/Contents/MacOS/vpn-proxy"
 
       - name: Package Mac tar.gz (preserves +x bits)
         run: |
