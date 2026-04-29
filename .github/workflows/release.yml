@@ -50,8 +50,31 @@ jobs:
 
   build-mac:
     runs-on: macos-latest
+    env:
+      PY_VERSION: "3.12.7"
+      PY_BUILD: "20241016"
     steps:
       - uses: actions/checkout@v4
+
+      - name: Bundle standalone Python (arm64 + x86_64)
+        run: |
+          BASE="https://github.com/astral-sh/python-build-standalone/releases/download/${PY_BUILD}"
+          FW="mac/ZubriTunnel.app/Contents/Frameworks"
+          mkdir -p "$FW"
+          for arch in aarch64 x86_64; do
+            URL="${BASE}/cpython-${PY_VERSION}+${PY_BUILD}-${arch}-apple-darwin-install_only.tar.gz"
+            echo "downloading $URL"
+            curl -fL "$URL" -o /tmp/py.tar.gz
+            mkdir -p "/tmp/py-${arch}"
+            tar -xzf /tmp/py.tar.gz -C "/tmp/py-${arch}"
+            outname="Python-arm64"
+            [ "$arch" = "x86_64" ] && outname="Python-x86_64"
+            mv "/tmp/py-${arch}/python" "$FW/$outname"
+            chmod +x "$FW/$outname/bin/python3"
+            "$FW/$outname/bin/python3" -c "import tkinter; print('tk ok ($arch)')" 2>/dev/null || echo "(tkinter check skipped — may not run on host arch)"
+            rm -f /tmp/py.tar.gz
+          done
+          ls -la "$FW"
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -59,12 +82,15 @@ jobs:
           go-version: '1.22'
           cache-dependency-path: mac/ZubriTunnel.app/Contents/Resources/go.sum
 
-      - name: Build vpn-proxy binary inside bundle
+      - name: Build vpn-proxy as universal binary
         run: |
           RES="mac/ZubriTunnel.app/Contents/Resources"
-          BIN="mac/ZubriTunnel.app/Contents/MacOS/vpn-proxy"
-          (cd "$RES" && go build -o "../MacOS/vpn-proxy" .)
-          ls -la "mac/ZubriTunnel.app/Contents/MacOS"
+          MACOS="mac/ZubriTunnel.app/Contents/MacOS"
+          (cd "$RES" && GOARCH=arm64 go build -o "../MacOS/vpn-proxy-arm64" .)
+          (cd "$RES" && GOARCH=amd64 go build -o "../MacOS/vpn-proxy-x86_64" .)
+          lipo -create "$MACOS/vpn-proxy-arm64" "$MACOS/vpn-proxy-x86_64" -output "$MACOS/vpn-proxy"
+          rm "$MACOS/vpn-proxy-arm64" "$MACOS/vpn-proxy-x86_64"
+          file "$MACOS/vpn-proxy"
 
       - name: Make scripts executable
         run: |
@@ -72,11 +98,12 @@ jobs:
           chmod +x "mac/ZubriTunnel.app/Contents/MacOS/launcher"
           chmod +x "mac/ZubriTunnel.app/Contents/MacOS/vpn-proxy"
 
-      - name: Package Mac tar.gz (preserves +x bits)
+      - name: Package Mac tar.gz (preserves +x bits + Python runtimes)
         run: |
           mkdir -p dist
           tar -czf dist/ZubriTunnel-mac.tar.gz \
             mac README.md VERSION
+          ls -lh dist/
 
       - uses: actions/upload-artifact@v4
         with:

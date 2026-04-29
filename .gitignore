@@ -22,6 +22,10 @@ windows/vpn-proxy.exe~
 
 # Mac binary (built locally from source)
 mac/vpn-proxy
+mac/ZubriTunnel.app/Contents/MacOS/vpn-proxy
+
+# Bundled Python runtimes (downloaded by CI for releases — never commit)
+mac/ZubriTunnel.app/Contents/Frameworks/
 
 # OS / editor noise
 .DS_Store

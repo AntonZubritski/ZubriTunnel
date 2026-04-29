@@ -15,6 +15,21 @@ fi
 
 cd "$RES"
 
+# 1. Сначала пробуем bundled Python внутри bundle (release-сборки).
+#    arm64 на Apple Silicon, x86_64 на Intel.
+ARCH="$(uname -m)"
+case "$ARCH" in
+    arm64)  BUNDLED="$HERE/../Frameworks/Python-arm64/bin/python3" ;;
+    x86_64) BUNDLED="$HERE/../Frameworks/Python-x86_64/bin/python3" ;;
+    *)      BUNDLED="" ;;
+esac
+
+if [ -n "$BUNDLED" ] && [ -x "$BUNDLED" ]; then
+    if "$BUNDLED" -c "import tkinter" >/dev/null 2>&1; then
+        PY="$BUNDLED"
+    fi
+fi
+
 # Поиск рабочего Python (с проверкой что tkinter импортируется)
 find_working_python() {
     local candidates=(
@@ -43,9 +58,12 @@ find_working_python() {
     return 1
 }
 
-PY="$(find_working_python)"
+# 2. Если bundled нет (например git clone без релиза) — ищем системный
+if [ -z "$PY" ]; then
+    PY="$(find_working_python)"
+fi
 
-# Если рабочий Python не найден — предлагаем авто-установку
+# 3. Если рабочий Python не найден ни там ни там — предлагаем авто-установку
 if [ -z "$PY" ]; then
     INSTALL_SCRIPT="$RES/install_deps.sh"
     chmod +x "$INSTALL_SCRIPT" 2>/dev/null
