@@ -63,6 +63,14 @@ jobs:
         working-directory: mac
         run: go build -o vpn-proxy .
 
+      - name: Bundle source into ZubriTunnel.app/Contents/Resources (self-contained)
+        run: |
+          RES="mac/ZubriTunnel.app/Contents/Resources"
+          mkdir -p "$RES/keys"
+          cp mac/gui.py mac/main.go mac/go.mod mac/go.sum mac/icon.png "$RES/"
+          cp mac/keys/example.json.template "$RES/keys/" 2>/dev/null || true
+          ls -la "$RES"
+
       - name: Make scripts executable
         run: |
           chmod +x mac/run.sh mac/gui.command
