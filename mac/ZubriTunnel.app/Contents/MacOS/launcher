@@ -15,16 +15,14 @@ fi
 
 cd "$RES"
 
-# Найти РАБОЧИЙ python3. Apple-овский /usr/bin/python3 на старых macOS ломается
-# с "macOS 15 required" — поэтому пробуем альтернативы и проверяем что каждый
-# реально запускается (даёт версию, не падает с dyld error).
+# Поиск рабочего Python (с проверкой что tkinter импортируется)
 find_working_python() {
     local candidates=(
-        /opt/homebrew/bin/python3        # Apple Silicon Homebrew
+        /opt/homebrew/bin/python3
         /opt/homebrew/bin/python3.12
         /opt/homebrew/bin/python3.11
         /opt/homebrew/bin/python3.10
-        /usr/local/bin/python3            # Intel Homebrew
+        /usr/local/bin/python3
         /usr/local/bin/python3.12
         /usr/local/bin/python3.11
         /usr/local/bin/python3.10
@@ -32,12 +30,11 @@ find_working_python() {
         /Library/Frameworks/Python.framework/Versions/3.11/bin/python3
         /Library/Frameworks/Python.framework/Versions/3.10/bin/python3
         "$(command -v python3 2>/dev/null)"
-        /usr/bin/python3                  # Apple stub (often broken)
+        /usr/bin/python3
     )
     for p in "${candidates[@]}"; do
         [ -z "$p" ] && continue
         [ -x "$p" ] || continue
-        # Проверяем что Python запускается без dyld-ошибок
         if "$p" -c "import tkinter" >/dev/null 2>&1; then
             echo "$p"
             return 0
@@ -47,9 +44,33 @@ find_working_python() {
 }
 
 PY="$(find_working_python)"
+
+# Если рабочий Python не найден — предлагаем авто-установку
 if [ -z "$PY" ]; then
-    osascript -e 'display alert "ZubriTunnel — нет рабочего Python" message "Установи Python 3 одним из способов:\n\n• Homebrew (рекомендую):\n   brew install python3 python-tk\n\n• Скачать с python.org:\n   https://www.python.org/downloads/macos\n\nApple-овский python3 в /usr/bin/ часто требует macOS 15+. Установка отдельного Python через Homebrew решает проблему."'
-    exit 1
+    INSTALL_SCRIPT="$RES/install_deps.sh"
+    chmod +x "$INSTALL_SCRIPT" 2>/dev/null
+
+    CHOICE=$(osascript <<EOF
+set userChoice to button returned of (display dialog "Для работы ZubriTunnel нужен Python 3 + Tkinter.
+
+Я могу установить их автоматически через Homebrew.
+Откроется Terminal — там понадобится ввести пароль администратора (это нормально для Homebrew).
+
+После завершения установки закрой Terminal и снова двойной клик по ZubriTunnel.app." buttons {"Отмена", "Установить"} default button "Установить" with icon caution with title "ZubriTunnel — нужен Python")
+return userChoice
+EOF
+    )
+
+    if [ "$CHOICE" = "Установить" ]; then
+        # Открываем Terminal с инсталлером
+        osascript <<EOF
+tell application "Terminal"
+    activate
+    do script "bash \"$INSTALL_SCRIPT\""
+end tell
+EOF
+    fi
+    exit 0
 fi
 
 {
