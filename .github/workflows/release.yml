@@ -48,13 +48,65 @@ jobs:
           name: windows
           path: dist/ZubriTunnel-windows.zip
 
+  # Build vpn-proxy NATIVELY on each macOS arch — avoids fragile cross-compilation
+  # of outline-sdk + x/mobile. Each runner produces a single-arch binary;
+  # the merge job below combines them with `lipo` and bundles Python runtimes.
+  build-mac-bin:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-14    # Apple Silicon
+            go-arch: arm64
+          - arch: x86_64
+            runner: macos-13    # Intel
+            go-arch: amd64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache-dependency-path: mac/ZubriTunnel.app/Contents/Resources/go.sum
+      - name: Build vpn-proxy (${{ matrix.arch }})
+        working-directory: mac/ZubriTunnel.app/Contents/Resources
+        run: go build -o /tmp/vpn-proxy-${{ matrix.arch }} .
+      - name: Inspect binary
+        run: file /tmp/vpn-proxy-${{ matrix.arch }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vpn-proxy-${{ matrix.arch }}
+          path: /tmp/vpn-proxy-${{ matrix.arch }}
+
   build-mac:
-    runs-on: macos-latest
+    needs: build-mac-bin
+    runs-on: macos-14
     env:
       PY_VERSION: "3.12.7"
       PY_BUILD: "20241016"
     steps:
       - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: vpn-proxy-arm64
+          path: /tmp/bin-arm64
+      - uses: actions/download-artifact@v4
+        with:
+          name: vpn-proxy-x86_64
+          path: /tmp/bin-x86_64
+
+      - name: Combine into universal vpn-proxy
+        run: |
+          MACOS="mac/ZubriTunnel.app/Contents/MacOS"
+          chmod +x /tmp/bin-arm64/vpn-proxy-arm64 /tmp/bin-x86_64/vpn-proxy-x86_64
+          lipo -create \
+            /tmp/bin-arm64/vpn-proxy-arm64 \
+            /tmp/bin-x86_64/vpn-proxy-x86_64 \
+            -output "$MACOS/vpn-proxy"
+          chmod +x "$MACOS/vpn-proxy"
+          file "$MACOS/vpn-proxy"
 
       - name: Bundle standalone Python (arm64 + x86_64)
         run: |
@@ -71,33 +123,14 @@ jobs:
             [ "$arch" = "x86_64" ] && outname="Python-x86_64"
             mv "/tmp/py-${arch}/python" "$FW/$outname"
             chmod +x "$FW/$outname/bin/python3"
-            "$FW/$outname/bin/python3" -c "import tkinter; print('tk ok ($arch)')" 2>/dev/null || echo "(tkinter check skipped — may not run on host arch)"
             rm -f /tmp/py.tar.gz
           done
           ls -la "$FW"
-
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: '1.22'
-          cache-dependency-path: mac/ZubriTunnel.app/Contents/Resources/go.sum
-
-      - name: Build vpn-proxy as universal binary (no CGO)
-        run: |
-          RES="mac/ZubriTunnel.app/Contents/Resources"
-          MACOS="mac/ZubriTunnel.app/Contents/MacOS"
-          export CGO_ENABLED=0
-          (cd "$RES" && GOARCH=arm64 GOOS=darwin go build -o "../MacOS/vpn-proxy-arm64" .)
-          (cd "$RES" && GOARCH=amd64 GOOS=darwin go build -o "../MacOS/vpn-proxy-x86_64" .)
-          lipo -create "$MACOS/vpn-proxy-arm64" "$MACOS/vpn-proxy-x86_64" -output "$MACOS/vpn-proxy"
-          rm "$MACOS/vpn-proxy-arm64" "$MACOS/vpn-proxy-x86_64"
-          file "$MACOS/vpn-proxy"
 
       - name: Make scripts executable
         run: |
           chmod +x mac/run.sh mac/gui.command
           chmod +x "mac/ZubriTunnel.app/Contents/MacOS/launcher"
-          chmod +x "mac/ZubriTunnel.app/Contents/MacOS/vpn-proxy"
 
       - name: Package Mac tar.gz (preserves +x bits + Python runtimes)
         run: |
