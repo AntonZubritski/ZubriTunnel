@@ -1,0 +1,1869 @@
+#!/usr/bin/env python3
+"""vpn-proxy GUI — управление ключами Outline и точечный запуск программ через прокси."""
+import json
+import os
+import platform
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import threading
+import time
+import tkinter as tk
+import urllib.error
+import urllib.request
+from pathlib import Path
+from tkinter import filedialog, messagebox, scrolledtext, simpledialog, ttk
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+KEYS_DIR = SCRIPT_DIR / "keys"
+DEFAULT_ADDR = "127.0.0.1:8080"
+IS_WIN = os.name == "nt"
+IS_MAC = sys.platform == "darwin"
+
+
+# ---------- helpers ----------
+
+def sanitize_json_bytes(data: bytes) -> bytes:
+    """Outline JSON often has raw control bytes inside strings → escape them."""
+    out = bytearray()
+    in_str = False
+    escaped = False
+    for b in data:
+        if not in_str:
+            if b == ord('"'):
+                in_str = True
+            out.append(b)
+            continue
+        if escaped:
+            escaped = False
+            out.append(b)
+            continue
+        if b == ord('\\'):
+            escaped = True
+            out.append(b)
+            continue
+        if b == ord('"'):
+            in_str = False
+            out.append(b)
+            continue
+        if b < 0x20:
+            out.extend(b"\\u%04x" % b)
+            continue
+        out.append(b)
+    return bytes(out)
+
+
+def go_command() -> list:
+    exe = SCRIPT_DIR / ("vpn-proxy.exe" if IS_WIN else "vpn-proxy")
+    if exe.exists():
+        return [str(exe)]
+    return ["go", "run", "."]
+
+
+def fetch_ssconf(url: str) -> dict:
+    https_url = url.replace("ssconf://", "https://", 1) if url.startswith("ssconf://") else url
+    req = urllib.request.Request(https_url, headers={"User-Agent": "vpn-proxy-gui"})
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        raw = resp.read()
+    return json.loads(sanitize_json_bytes(raw).decode("utf-8", errors="replace"))
+
+
+# --- VanyaVPN-style provider API (host extracted from ssconf URL, UUID is the token) ---
+
+import re as _re_uuid
+
+_UUID_RE = _re_uuid.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+
+
+def parse_ssconf_url(url: str) -> tuple[str, str] | None:
+    """Return (host, uuid) from ssconf URL, or None if not parseable."""
+    if not url:
+        return None
+    https_url = url.replace("ssconf://", "https://", 1) if url.startswith("ssconf://") else url
+    try:
+        from urllib.parse import urlparse
+        u = urlparse(https_url)
+        host = u.hostname
+        m = _UUID_RE.search(u.path)
+        if not host or not m:
+            return None
+        return host, m.group(0)
+    except Exception:
+        return None
+
+
+def fetch_provider_locations(ssconf_url: str, lang: str = "ru") -> list:
+    """GET /app/v1/sync/available-locations — returns list of {description,value,code,bestLocation,systemLocation,speed}."""
+    parsed = parse_ssconf_url(ssconf_url)
+    if not parsed:
+        raise ValueError("ссылка не похожа на ssconf:// с UUID")
+    host, uuid = parsed
+    api = f"https://{host}/app/v1/sync/available-locations?lang={lang}&token={uuid}"
+    req = urllib.request.Request(api, headers={"User-Agent": "vpn-proxy-gui"})
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        return json.loads(resp.read().decode("utf-8", errors="replace"))
+
+
+def change_provider_location(ssconf_url: str, location_value: str, lang: str = "ru") -> dict:
+    """GET /app/v1/user/location/change — returns {tag: ...}."""
+    parsed = parse_ssconf_url(ssconf_url)
+    if not parsed:
+        raise ValueError("ссылка не похожа на ssconf:// с UUID")
+    host, uuid = parsed
+    api = f"https://{host}/app/v1/user/location/change?token={uuid}&location={location_value}&lang={lang}"
+    req = urllib.request.Request(api, headers={"User-Agent": "vpn-proxy-gui"})
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        return json.loads(resp.read().decode("utf-8", errors="replace"))
+
+
+def parse_json_text(text: str) -> dict:
+    return json.loads(sanitize_json_bytes(text.encode("utf-8")).decode("utf-8", errors="replace"))
+
+
+def slugify(name: str) -> str:
+    keep = "abcdefghijklmnopqrstuvwxyz0123456789-_"
+    s = "".join(c if c in keep else "-" for c in name.lower())
+    while "--" in s:
+        s = s.replace("--", "-")
+    return s.strip("-") or "key"
+
+
+def list_keys() -> list:
+    KEYS_DIR.mkdir(exist_ok=True)
+    out = []
+    for f in sorted(KEYS_DIR.glob("*.json")):
+        try:
+            data = json.loads(sanitize_json_bytes(f.read_bytes()).decode("utf-8", errors="replace"))
+            out.append({
+                "name": f.stem,
+                "path": f,
+                "tag": data.get("tag", ""),
+                "server": data.get("server", ""),
+                "port": data.get("server_port", 0),
+                "ok": bool(data.get("method") and data.get("password") and data.get("server")),
+            })
+        except Exception as e:
+            out.append({"name": f.stem, "path": f, "tag": f"(broken: {e})", "server": "", "port": 0, "ok": False})
+    return out
+
+
+def detect_apps() -> list:
+    """Return list of (name, command) for known apps installed on this system."""
+    apps = []
+    if IS_WIN:
+        local = os.environ.get("LOCALAPPDATA", "")
+        candidates = [
+            ("VSCode", [r"C:\Program Files\Microsoft VS Code\Code.exe", fr"{local}\Programs\Microsoft VS Code\Code.exe"]),
+            ("Git Bash", [r"C:\Program Files\Git\git-bash.exe", r"C:\Program Files (x86)\Git\git-bash.exe"]),
+            ("PowerShell", [r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"]),
+            ("Windows Terminal", [fr"{local}\Microsoft\WindowsApps\wt.exe"]),
+            ("Cursor", [fr"{local}\Programs\cursor\Cursor.exe"]),
+            ("Chrome", [r"C:\Program Files\Google\Chrome\Application\chrome.exe", r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"]),
+            ("Firefox", [r"C:\Program Files\Mozilla Firefox\firefox.exe"]),
+            ("Edge", [r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"]),
+        ]
+        for name, paths in candidates:
+            for p in paths:
+                if os.path.exists(p):
+                    apps.append((name, [p]))
+                    break
+    elif IS_MAC:
+        candidates = [
+            ("VSCode",   "/Applications/Visual Studio Code.app/Contents/MacOS/Electron"),
+            ("Cursor",   "/Applications/Cursor.app/Contents/MacOS/Cursor"),
+            ("Terminal", "/System/Applications/Utilities/Terminal.app"),
+            ("iTerm",    "/Applications/iTerm.app"),
+            ("Chrome",   "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+            ("Firefox",  "/Applications/Firefox.app/Contents/MacOS/firefox"),
+            ("Safari",   "/Applications/Safari.app"),
+        ]
+        for name, p in candidates:
+            if not os.path.exists(p):
+                continue
+            if p.endswith(".app"):
+                apps.append((name, ["open", "-na", p]))
+            else:
+                apps.append((name, [p]))
+    return apps
+
+
+def is_port_free(host: str, port: int) -> bool:
+    """Try to bind to host:port. Returns True if successful (port is free)."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
+            s.bind((host, port))
+            return True
+    except OSError:
+        return False
+
+
+def find_free_port(host: str = "127.0.0.1", preferred: int = 8080, avoid: set | None = None) -> int:
+    """Try preferred port first, then nearby ranges, then fall back to OS-assigned.
+    Pass `avoid` to skip ports already reserved by other proxies in this session.
+    """
+    avoid = avoid or set()
+    candidates = [preferred] + list(range(preferred + 1, preferred + 30)) + list(range(18080, 18100))
+    for p in candidates:
+        if p in avoid:
+            continue
+        if is_port_free(host, p):
+            return p
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind((host, 0))
+        return s.getsockname()[1]
+
+
+def proxy_env(proxy_url: str) -> dict:
+    e = os.environ.copy()
+    e.update({
+        "HTTP_PROXY": proxy_url, "HTTPS_PROXY": proxy_url,
+        "http_proxy": proxy_url, "https_proxy": proxy_url,
+        "ALL_PROXY": proxy_url, "NO_PROXY": "localhost,127.0.0.1",
+    })
+    return e
+
+
+def http_get_via_proxy(url: str, proxy: str, timeout: float = 10.0) -> str:
+    handler = urllib.request.ProxyHandler({"http": proxy, "https": proxy})
+    opener = urllib.request.build_opener(handler)
+    with opener.open(url, timeout=timeout) as resp:
+        return resp.read().decode("utf-8", errors="replace").strip()
+
+
+# ---------- rounded canvas widgets ----------
+
+def _rounded_rect_points(w: int, h: int, r: int):
+    r = max(0, min(r, min(w, h) // 2))
+    return [
+        r, 0, w - r, 0, w, 0, w, r,
+        w, h - r, w, h, w - r, h, r, h,
+        0, h, 0, h - r, 0, r, 0, 0,
+    ]
+
+
+class RoundButton(tk.Canvas):
+    """Pill-style button drawn on Canvas. Plugs in like ttk.Button."""
+
+    def __init__(self, parent, text: str = "", command=None, *,
+                 variant: str = "default",
+                 radius: int = 12, padx: int = 16, pady: int = 8,
+                 width: int | None = None, font=None, **kw):
+        self._variant = variant
+        self._command = command
+        self._text = text
+        self._font = font or UI_FONT
+        self._radius = radius
+        self._padx = padx
+        self._pady = pady
+        self._enabled = True
+        self._state = "normal"  # normal | hover | pressed | disabled
+
+        # Parent bg for matching outer corners
+        try:
+            parent_bg = parent.cget("bg")
+        except tk.TclError:
+            parent_bg = COLORS["bg"]
+        super().__init__(parent, highlightthickness=0, bd=0, bg=parent_bg, **kw)
+        self._sync_size(width)
+
+        self.bind("<Enter>", self._on_enter)
+        self.bind("<Leave>", self._on_leave)
+        self.bind("<ButtonPress-1>", self._on_press)
+        self.bind("<ButtonRelease-1>", self._on_release)
+        self.bind("<Configure>", lambda _e: self._draw())
+
+    def _sync_size(self, width: int | None):
+        from tkinter.font import Font as TkFont
+        f = TkFont(family=self._font[0], size=self._font[1],
+                   weight=("bold" if (len(self._font) > 2 and "bold" in str(self._font[2])) else "normal"))
+        tw = f.measure(self._text) + 2 * self._padx
+        if width is not None:
+            tw = max(tw, width)
+        th = f.metrics("linespace") + 2 * self._pady
+        self.configure(width=tw, height=th)
+
+    def _palette(self):
+        v = self._variant
+        if not self._enabled:
+            return COLORS["panel"], COLORS["muted"]
+        if v == "accent":
+            base_bg = COLORS["accent"]; base_fg = COLORS["bg"]
+            hover_bg = COLORS["accent_d"]; hover_fg = COLORS["bg"]
+            press_bg = COLORS["accent_d"]; press_fg = COLORS["bg"]
+        elif v == "tool":
+            base_bg = COLORS["panel"]; base_fg = COLORS["text"]
+            hover_bg = COLORS["panel2"]; hover_fg = COLORS["accent"]
+            press_bg = COLORS["accent_d"]; press_fg = COLORS["bg"]
+        else:  # default
+            base_bg = COLORS["panel2"]; base_fg = COLORS["text"]
+            hover_bg = COLORS["border"]; hover_fg = COLORS["accent"]
+            press_bg = COLORS["accent_d"]; press_fg = COLORS["bg"]
+        if self._state == "hover":
+            return hover_bg, hover_fg
+        if self._state == "pressed":
+            return press_bg, press_fg
+        return base_bg, base_fg
+
+    def _draw(self):
+        self.delete("all")
+        w = int(self.winfo_width() or self.winfo_reqwidth())
+        h = int(self.winfo_height() or self.winfo_reqheight())
+        if w < 4 or h < 4:
+            return
+        bg, fg = self._palette()
+        # match parent bg around rounded shape
+        try:
+            self.configure(bg=self.master.cget("bg"))
+        except tk.TclError:
+            pass
+        self.create_polygon(_rounded_rect_points(w, h, self._radius),
+                            smooth=True, fill=bg, outline="")
+        self.create_text(w / 2, h / 2, text=self._text, fill=fg, font=self._font)
+
+    def _on_enter(self, _e):
+        if not self._enabled: return
+        self._state = "hover"; self._draw()
+
+    def _on_leave(self, _e):
+        if not self._enabled: return
+        self._state = "normal"; self._draw()
+
+    def _on_press(self, _e):
+        if not self._enabled: return
+        self._state = "pressed"; self._draw()
+
+    def _on_release(self, e):
+        if not self._enabled: return
+        # detect if release was inside the widget
+        x, y = e.x, e.y
+        inside = 0 <= x <= self.winfo_width() and 0 <= y <= self.winfo_height()
+        self._state = "hover" if inside else "normal"
+        self._draw()
+        if inside and self._command:
+            try:
+                self._command()
+            except Exception as ex:
+                print(f"button cmd error: {ex}", file=sys.stderr)
+
+    # ttk-like API
+    def configure(self, **kw):
+        if "state" in kw:
+            self.set_state(kw.pop("state"))
+        if "text" in kw:
+            self._text = kw.pop("text")
+            self._sync_size(None)
+            self._draw()
+        if kw:
+            super().configure(**kw)
+
+    def cget(self, key):
+        if key == "state":
+            return "normal" if self._enabled else "disabled"
+        return super().cget(key)
+
+    def set_state(self, state: str):
+        self._enabled = (state == "normal")
+        self._state = "normal" if self._enabled else "disabled"
+        self._draw()
+
+
+class RoundedCard(tk.Frame):
+    """Frame with rounded-rect background drawn behind. Body is inset so the
+    rounded corners actually show — otherwise the rectangular body Frame would
+    cover them entirely with the same panel colour."""
+
+    _scale_hint = 1.0  # set externally before construction in App.__init__
+
+    def __init__(self, parent, *, radius: int = 14, fill: str | None = None, **kw):
+        try:
+            parent_bg = parent.cget("bg")
+        except tk.TclError:
+            parent_bg = COLORS["bg"]
+        super().__init__(parent, bg=parent_bg, **kw)
+        # Scale radius for hi-DPI so corners look proportionate
+        self._radius = int(radius * RoundedCard._scale_hint)
+        self._fill = fill or COLORS["panel"]
+        # Canvas behind everything, drawn with smooth rounded rect
+        self._canvas = tk.Canvas(self, bg=parent_bg, highlightthickness=0, bd=0)
+        self._canvas.place(relx=0, rely=0, relwidth=1, relheight=1)
+        # Body inset by radius so the rounded corners of the canvas
+        # are visible at the card's outer edges.
+        inset = max(2, int(self._radius * 0.5))
+        self.body = tk.Frame(self, bg=self._fill)
+        self.body.pack(fill="both", expand=True, padx=inset, pady=inset)
+        self.bind("<Configure>", lambda _e: self._draw())
+
+    def _draw(self):
+        self._canvas.delete("all")
+        w = int(self.winfo_width()); h = int(self.winfo_height())
+        if w < 4 or h < 4:
+            return
+        try:
+            self._canvas.configure(bg=self.master.cget("bg"))
+        except tk.TclError:
+            pass
+        self._canvas.create_polygon(_rounded_rect_points(w, h, self._radius),
+                                    smooth=True, fill=self._fill, outline="")
+
+
+# ---------- main GUI ----------
+
+APP_NAME = "ZubriTunnel"
+SETTINGS_FILE = SCRIPT_DIR / "settings.json"
+
+DARK_COLORS = {
+    "bg":       "#161616",
+    "panel":    "#1E1E1E",
+    "panel2":   "#2A2A2A",
+    "border":   "#3A3A3A",
+    "text":     "#E8E8E8",
+    "muted":    "#9A9A9A",
+    "accent":   "#26C6DA",
+    "accent_d": "#00ACC1",
+    "ok":       "#26C6DA",
+    "warn":     "#F2C94C",
+    "err":      "#EF6C6C",
+    "select":   "#2C3D42",
+}
+
+LIGHT_COLORS = {
+    "bg":       "#F2F2F2",
+    "panel":    "#FFFFFF",
+    "panel2":   "#E8E8E8",
+    "border":   "#D0D0D0",
+    "text":     "#1A1A1A",
+    "muted":    "#666666",
+    "accent":   "#00838F",
+    "accent_d": "#005662",
+    "ok":       "#00838F",
+    "warn":     "#B58100",
+    "err":      "#C62828",
+    "select":   "#CFEEF2",
+}
+
+# Active palette — set by apply_theme()
+COLORS = dict(DARK_COLORS)
+
+
+def detect_system_theme() -> str:
+    """Return 'dark' or 'light' based on the OS preference."""
+    if os.name == "nt":
+        try:
+            import winreg
+            with winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize",
+            ) as k:
+                v, _ = winreg.QueryValueEx(k, "AppsUseLightTheme")
+                return "light" if v == 1 else "dark"
+        except Exception:
+            return "dark"
+    if sys.platform == "darwin":
+        try:
+            r = subprocess.run(
+                ["defaults", "read", "-g", "AppleInterfaceStyle"],
+                capture_output=True, text=True, timeout=2,
+            )
+            return "dark" if r.stdout.strip().lower() == "dark" else "light"
+        except Exception:
+            return "light"
+    return "dark"
+
+
+def load_settings() -> dict:
+    try:
+        return json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def save_settings(s: dict) -> None:
+    try:
+        SETTINGS_FILE.write_text(json.dumps(s, indent=2, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def apply_dark_titlebar(root: tk.Tk, dark: bool):
+    """Tell Windows DWM to draw the title bar in dark mode."""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+        root.update_idletasks()
+        hwnd = ctypes.windll.user32.GetParent(root.winfo_id()) or root.winfo_id()
+        DWMWA_USE_IMMERSIVE_DARK_MODE = 20  # Windows 10 1809+ / Windows 11
+        value = ctypes.c_int(1 if dark else 0)
+        ctypes.windll.dwmapi.DwmSetWindowAttribute(
+            wintypes.HWND(hwnd),
+            wintypes.DWORD(DWMWA_USE_IMMERSIVE_DARK_MODE),
+            ctypes.byref(value),
+            ctypes.sizeof(value),
+        )
+        # Trigger title bar repaint via tiny resize
+        w, h = root.winfo_width(), root.winfo_height()
+        if w > 0 and h > 0:
+            root.geometry(f"{w}x{h+1}")
+            root.geometry(f"{w}x{h}")
+    except Exception:
+        pass
+
+UI_FONT = ("Segoe UI", 10) if os.name == "nt" else ("SF Pro Text", 12)
+UI_FONT_BOLD = ("Segoe UI Semibold", 10) if os.name == "nt" else ("SF Pro Display", 12, "bold")
+UI_FONT_TITLE = ("Segoe UI Semibold", 13) if os.name == "nt" else ("SF Pro Display", 14, "bold")
+UI_FONT_MONO = ("Cascadia Mono", 9) if os.name == "nt" else ("SF Mono", 10)
+
+
+def resolve_theme(setting: str) -> str:
+    """Translate 'system' into actual 'dark' or 'light'."""
+    s = (setting or "system").lower()
+    if s == "system":
+        return detect_system_theme()
+    if s in ("dark", "light"):
+        return s
+    return detect_system_theme()
+
+
+def apply_theme(root: tk.Tk, mode: str = "system"):
+    """Apply visual theme to root and children. mode: 'system' | 'dark' | 'light'."""
+    actual = resolve_theme(mode)
+    palette = DARK_COLORS if actual == "dark" else LIGHT_COLORS
+    COLORS.clear()
+    COLORS.update(palette)
+
+    style = ttk.Style(root)
+    try:
+        style.theme_use("clam")
+    except tk.TclError:
+        pass
+
+    root.configure(bg=COLORS["bg"])
+
+    style.configure(".", background=COLORS["bg"], foreground=COLORS["text"], font=UI_FONT, borderwidth=0)
+    style.configure("TFrame", background=COLORS["bg"])
+    style.configure("Card.TFrame", background=COLORS["panel"], relief="flat")
+    style.configure("TLabel", background=COLORS["bg"], foreground=COLORS["text"], font=UI_FONT)
+    style.configure("Title.TLabel", background=COLORS["bg"], foreground=COLORS["text"], font=UI_FONT_TITLE)
+    style.configure("Muted.TLabel", background=COLORS["bg"], foreground=COLORS["muted"], font=UI_FONT)
+    style.configure("Card.TLabel", background=COLORS["panel"], foreground=COLORS["text"])
+    style.configure("CardMuted.TLabel", background=COLORS["panel"], foreground=COLORS["muted"])
+
+    # Buttons: subtle filled; accent variant for primary action
+    style.configure("TButton",
+                    background=COLORS["panel2"], foreground=COLORS["text"],
+                    padding=(12, 6), borderwidth=0, font=UI_FONT, focusthickness=0,
+                    relief="flat")
+    style.map("TButton",
+              background=[("pressed", COLORS["accent_d"]),
+                          ("active", COLORS["border"]),
+                          ("disabled", COLORS["panel"])],
+              foreground=[("pressed", COLORS["bg"]),
+                          ("active", COLORS["accent"]),
+                          ("disabled", COLORS["muted"])])
+
+    style.configure("Accent.TButton",
+                    background=COLORS["accent"], foreground=COLORS["bg"],
+                    padding=(14, 7), font=UI_FONT_BOLD,
+                    borderwidth=0, focusthickness=0, relief="flat")
+    style.map("Accent.TButton",
+              background=[("pressed", COLORS["accent_d"]),
+                          ("active", COLORS["accent_d"]),
+                          ("disabled", COLORS["panel"])],
+              foreground=[("disabled", COLORS["muted"])])
+
+    style.configure("Tool.TButton",
+                    background=COLORS["panel"], foreground=COLORS["text"],
+                    padding=(8, 4), font=UI_FONT,
+                    borderwidth=0, focusthickness=0, relief="flat")
+    style.map("Tool.TButton",
+              background=[("pressed", COLORS["accent_d"]),
+                          ("active", COLORS["panel2"]),
+                          ("disabled", COLORS["panel"])],
+              foreground=[("pressed", COLORS["bg"]),
+                          ("active", COLORS["accent"]),
+                          ("disabled", COLORS["muted"])])
+
+    # Treeview — rowheight needs to scale with DPI so text doesn't get clipped
+    scale = getattr(root, "_dpi_scale", 1.0)
+    style.configure("Treeview",
+                    background=COLORS["panel"], fieldbackground=COLORS["panel"],
+                    foreground=COLORS["text"], rowheight=int(28 * scale),
+                    borderwidth=0, font=UI_FONT)
+    style.configure("Treeview.Heading",
+                    background=COLORS["panel2"], foreground=COLORS["muted"],
+                    relief="flat", padding=(int(8 * scale), int(6 * scale)),
+                    font=UI_FONT_BOLD)
+    style.map("Treeview",
+              background=[("selected", COLORS["select"])],
+              foreground=[("selected", COLORS["accent"])])
+    style.map("Treeview.Heading", background=[("active", COLORS["panel2"])])
+
+    # Radiobutton
+    style.configure("TRadiobutton",
+                    background=COLORS["bg"], foreground=COLORS["text"],
+                    indicatorcolor=COLORS["panel2"], focusthickness=0,
+                    font=UI_FONT, padding=2)
+    style.map("TRadiobutton",
+              background=[("active", COLORS["bg"]), ("focus", COLORS["bg"])],
+              foreground=[("active", COLORS["accent"]),
+                          ("selected", COLORS["accent"]),
+                          ("disabled", COLORS["muted"])],
+              indicatorcolor=[("selected !disabled", COLORS["accent"]),
+                              ("active selected", COLORS["accent_d"]),
+                              ("active !selected", COLORS["border"]),
+                              ("!selected", COLORS["panel2"])])
+
+    # Checkbutton (for completeness)
+    style.configure("TCheckbutton",
+                    background=COLORS["bg"], foreground=COLORS["text"],
+                    indicatorcolor=COLORS["panel2"], focusthickness=0,
+                    font=UI_FONT, padding=2)
+    style.map("TCheckbutton",
+              background=[("active", COLORS["bg"])],
+              foreground=[("active", COLORS["accent"]),
+                          ("selected", COLORS["accent"]),
+                          ("disabled", COLORS["muted"])],
+              indicatorcolor=[("selected", COLORS["accent"]),
+                              ("active selected", COLORS["accent_d"]),
+                              ("!selected", COLORS["panel2"])])
+
+    # LabelFrame
+    style.configure("TLabelframe", background=COLORS["bg"], borderwidth=0)
+    style.configure("TLabelframe.Label", background=COLORS["bg"], foreground=COLORS["muted"],
+                    font=UI_FONT_BOLD)
+
+    # Combobox (for future use)
+    style.configure("TCombobox",
+                    fieldbackground=COLORS["panel"], background=COLORS["panel2"],
+                    foreground=COLORS["text"], arrowcolor=COLORS["muted"],
+                    bordercolor=COLORS["border"], lightcolor=COLORS["border"], darkcolor=COLORS["border"])
+    style.map("TCombobox",
+              fieldbackground=[("readonly", COLORS["panel"])],
+              foreground=[("readonly", COLORS["text"])],
+              bordercolor=[("focus", COLORS["accent"])])
+
+    # Entry
+    style.configure("TEntry",
+                    fieldbackground=COLORS["panel"], foreground=COLORS["text"],
+                    insertcolor=COLORS["accent"], borderwidth=1, bordercolor=COLORS["border"],
+                    lightcolor=COLORS["border"], darkcolor=COLORS["border"], padding=4)
+    style.map("TEntry", bordercolor=[("focus", COLORS["accent"])])
+
+    # Scrollbar — theme-coloured, no top/bottom arrows
+    style.layout("Vertical.TScrollbar", [
+        ("Vertical.Scrollbar.trough", {
+            "sticky": "ns",
+            "children": [
+                ("Vertical.Scrollbar.thumb", {"expand": "1", "sticky": "nswe"}),
+            ],
+        }),
+    ])
+    style.layout("Horizontal.TScrollbar", [
+        ("Horizontal.Scrollbar.trough", {
+            "sticky": "we",
+            "children": [
+                ("Horizontal.Scrollbar.thumb", {"expand": "1", "sticky": "nswe"}),
+            ],
+        }),
+    ])
+    style.configure("Vertical.TScrollbar",
+                    background=COLORS["panel2"],
+                    troughcolor=COLORS["bg"],
+                    bordercolor=COLORS["bg"],
+                    lightcolor=COLORS["panel2"],
+                    darkcolor=COLORS["panel2"],
+                    relief="flat", borderwidth=0, arrowsize=0, gripcount=0)
+    style.map("Vertical.TScrollbar",
+              background=[("active", COLORS["accent"]),
+                          ("pressed", COLORS["accent_d"])])
+    style.configure("Horizontal.TScrollbar",
+                    background=COLORS["panel2"],
+                    troughcolor=COLORS["bg"],
+                    bordercolor=COLORS["bg"],
+                    lightcolor=COLORS["panel2"],
+                    darkcolor=COLORS["panel2"],
+                    relief="flat", borderwidth=0, arrowsize=0)
+    style.map("Horizontal.TScrollbar",
+              background=[("active", COLORS["accent"]),
+                          ("pressed", COLORS["accent_d"])])
+
+    apply_dark_titlebar(root, actual == "dark")
+    return actual
+
+
+class App(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title(APP_NAME)
+        # Compute DPI scale and resize fonts/window accordingly
+        self._dpi_scale = self._detect_dpi_scale()
+        try:
+            self.tk.call("tk", "scaling", self._dpi_scale * 1.333)
+        except Exception:
+            pass
+        # Tell RoundedCard / RoundButton to scale radius / paddings to DPI
+        RoundedCard._scale_hint = self._dpi_scale
+        w = int(860 * self._dpi_scale)
+        h = int(700 * self._dpi_scale)
+        self.geometry(f"{w}x{h}")
+        # minimum width so layout doesn't break; height is auto-fitted to content
+        self.minsize(int(760 * self._dpi_scale), int(400 * self._dpi_scale))
+
+        self.settings = load_settings()
+        self.theme_mode = self.settings.get("theme", "system")  # 'system' | 'dark' | 'light'
+        self.actual_theme = apply_theme(self, self.theme_mode)
+        self._set_window_icon()
+
+        self.proxies: dict[str, dict] = {}
+        self.log_lock = threading.Lock()
+
+        self._build_ui()
+        self.refresh_keys()
+        self.after(500, self._poll_procs)
+        # Re-apply dark titlebar after window is fully realised
+        self.after(50, lambda: apply_dark_titlebar(self, self.actual_theme == "dark"))
+        # Shrink window to content's natural height (no big empty space below)
+        self.after(80, self._fit_window_to_content)
+
+    def _fit_window_to_content(self):
+        try:
+            self.update_idletasks()
+            cur_w = self.winfo_width()
+            # Find the scroll-inner content height
+            inner_h = 0
+            scroll = getattr(self, "_scroll_canvas", None)
+            if scroll is not None:
+                bbox = scroll.bbox("all")
+                if bbox:
+                    inner_h = bbox[3] - bbox[1]
+            # Fallback to full reqheight
+            if inner_h <= 0:
+                inner_h = self.winfo_reqheight()
+            # Add a small margin for title bar / chrome (Tk doesn't include it)
+            chrome = int(40 * self._dpi_scale)
+            screen_h = self.winfo_screenheight()
+            new_h = min(inner_h + chrome, int(screen_h * 0.9))
+            if new_h > 100:
+                self.geometry(f"{cur_w}x{new_h}")
+        except Exception:
+            pass
+
+    def _detect_dpi_scale(self) -> float:
+        """Return DPI scale factor (1.0 = 96 DPI = 100%)."""
+        if os.name == "nt":
+            try:
+                import ctypes
+                hdc = ctypes.windll.user32.GetDC(0)
+                dpi = ctypes.windll.gdi32.GetDeviceCaps(hdc, 88)  # LOGPIXELSX
+                ctypes.windll.user32.ReleaseDC(0, hdc)
+                if dpi > 0:
+                    return dpi / 96.0
+            except Exception:
+                pass
+        if sys.platform == "darwin":
+            # macOS uses Retina 2x; Tk handles this automatically with proper awareness
+            return 1.0
+        return 1.0
+
+    def _set_window_icon(self):
+        ico = SCRIPT_DIR / "icon.ico"
+        png = SCRIPT_DIR / "icon.png"
+        try:
+            if IS_WIN and ico.exists():
+                # Set both this window's icon AND the default for any future Toplevel
+                self.iconbitmap(default=str(ico))
+                self.iconbitmap(str(ico))
+            if png.exists():
+                img = tk.PhotoImage(file=str(png))
+                self.iconphoto(True, img)
+                self._icon_ref = img
+        except Exception:
+            pass
+
+    # ---- UI ----
+
+    def _build_ui(self):
+        # log buffer (lines), plus reference to popup window if open
+        self._log_buffer: list[str] = []
+        self._log_window = None
+
+        self.configure(bg=COLORS["bg"])
+
+        # Scrollable container so content stays accessible if window is small
+        scroll_host = tk.Frame(self, bg=COLORS["bg"])
+        scroll_host.pack(fill="both", expand=True)
+        scroll_canvas = tk.Canvas(scroll_host, bg=COLORS["bg"],
+                                  highlightthickness=0, bd=0)
+        self._scroll_canvas = scroll_canvas
+        vbar = ttk.Scrollbar(scroll_host, orient="vertical", command=scroll_canvas.yview)
+        scroll_canvas.configure(yscrollcommand=vbar.set)
+        scroll_canvas.pack(side="left", fill="both", expand=True)
+        vbar.pack(side="right", fill="y")
+        # Direct content frame inside the canvas — no extra padding wrapper to avoid
+        # Tk's circular sizing (canvas sizes to inner, inner sizes to outer with expand=True).
+        outer = tk.Frame(scroll_canvas, bg=COLORS["bg"], padx=18, pady=16)
+        scroll_inner_id = scroll_canvas.create_window((0, 0), window=outer, anchor="nw")
+
+        def _on_canvas_configure(event):
+            scroll_canvas.itemconfigure(scroll_inner_id, width=event.width)
+
+        def _on_inner_configure(_event):
+            bbox = scroll_canvas.bbox("all")
+            if bbox:
+                scroll_canvas.configure(scrollregion=bbox)
+                # Hide the scrollbar when content fits — keeps the look clean
+                inner_h = bbox[3] - bbox[1]
+                canvas_h = scroll_canvas.winfo_height()
+                if inner_h <= canvas_h:
+                    if vbar.winfo_ismapped():
+                        vbar.pack_forget()
+                else:
+                    if not vbar.winfo_ismapped():
+                        vbar.pack(side="right", fill="y")
+
+        scroll_canvas.bind("<Configure>", _on_canvas_configure)
+        outer.bind("<Configure>", _on_inner_configure)
+
+        def _on_mousewheel(event):
+            # Only scroll if there's something to scroll
+            bbox = scroll_canvas.bbox("all")
+            if not bbox:
+                return
+            if (bbox[3] - bbox[1]) <= scroll_canvas.winfo_height():
+                return
+            delta = -1 if (getattr(event, "num", 0) == 5 or event.delta < 0) else 1
+            scroll_canvas.yview_scroll(delta * 3, "units")
+        self.bind_all("<MouseWheel>", _on_mousewheel)
+        self.bind_all("<Button-4>", _on_mousewheel)
+        self.bind_all("<Button-5>", _on_mousewheel)
+
+        # Force view to top after initial layout
+        self.after(10, lambda: scroll_canvas.yview_moveto(0))
+
+        # Top: brand + theme switch
+        head = tk.Frame(outer, bg=COLORS["bg"])
+        head.pack(fill="x", pady=(0, 14))
+        tk.Label(head, text=APP_NAME, bg=COLORS["bg"], fg=COLORS["text"],
+                 font=UI_FONT_TITLE).pack(side="left")
+        tk.Label(head, text="• точечный VPN для приложений", bg=COLORS["bg"],
+                 fg=COLORS["muted"], font=UI_FONT).pack(side="left", padx=8)
+        self.theme_var = tk.StringVar(value=self.theme_mode)
+        theme_box = tk.Frame(head, bg=COLORS["bg"])
+        theme_box.pack(side="right")
+        tk.Label(theme_box, text="тема:", bg=COLORS["bg"], fg=COLORS["muted"],
+                 font=UI_FONT).pack(side="left", padx=(0, 6))
+        for code, label in [("system", "системная"), ("dark", "тёмная"), ("light", "светлая")]:
+            ttk.Radiobutton(theme_box, text=label, value=code, variable=self.theme_var,
+                            command=self._on_theme_change).pack(side="left", padx=4)
+
+        # Status card
+        bar = RoundedCard(outer, radius=18, fill=COLORS["panel"])
+        bar.pack(fill="x", pady=(0, 12))
+        bar.body.configure(bg=COLORS["panel"])
+        bar_pad = tk.Frame(bar.body, bg=COLORS["panel"])
+        bar_pad.pack(fill="x", padx=18, pady=14)
+        self.status_dot = tk.Label(bar_pad, text="●", fg=COLORS["muted"], bg=COLORS["panel"],
+                                   font=(UI_FONT[0], 16))
+        self.status_dot.pack(side="left")
+        self.status_text = tk.Label(bar_pad, text="выбери ключ", anchor="w",
+                                    bg=COLORS["panel"], fg=COLORS["text"], font=UI_FONT)
+        self.status_text.pack(side="left", padx=10, fill="x", expand=True)
+
+        # Keys card
+        kf = self._rounded_card(outer, title="Ключи")
+        kf.pack(fill="both", expand=False, pady=(0, 12))
+
+        cols = ("status", "name", "tag", "server", "port")
+        self.tree = ttk.Treeview(kf.content, columns=cols, show="headings", height=4, selectmode="browse")
+        scale = self._dpi_scale
+        # widths are tuned so wide text like "○ не подключён" fits comfortably
+        for c, label, w in [("status", "состояние", 220), ("name", "имя", 160), ("tag", "регион", 200),
+                            ("server", "сервер", 240), ("port", "порт", 90)]:
+            self.tree.heading(c, text=label)
+            self.tree.column(c, width=int(w * scale), stretch=(c == "server"), anchor="w")
+        self.tree.pack(fill="x", pady=(0, 10))
+        self.tree.bind("<<TreeviewSelect>>", lambda _e: self._on_select_key())
+        self.tree.bind("<Double-1>", lambda _e: self.show_apps_dialog())
+
+        self.empty_hint = tk.Label(
+            kf.content,
+            text="Ключей пока нет.  Нажми «+ ssconf://» и вставь ссылку — добавится автоматически.",
+            bg=COLORS["panel"], fg=COLORS["muted"], font=UI_FONT,
+            wraplength=720, justify="left",
+        )
+
+        kbar = tk.Frame(kf.content, bg=COLORS["panel"])
+        kbar.pack(fill="x")
+        for text, cmd in [
+            ("+ ssconf://", self.add_ssconf),
+            ("+ JSON", self.add_json),
+            ("+ файл…", self.add_file),
+            ("клонировать", self.clone_key),
+            ("сменить регион", self.change_region),
+        ]:
+            RoundButton(kbar, text=text, variant="tool", command=cmd).pack(side="left", padx=(0, 6))
+        RoundButton(kbar, text="↻", variant="tool", command=self.refresh_keys).pack(side="left", padx=(0, 6))
+        RoundButton(kbar, text="удалить", variant="tool", command=self.delete_key).pack(side="right", padx=(6, 0))
+        RoundButton(kbar, text="открыть keys/", variant="tool", command=self.open_keys_dir).pack(side="right")
+
+        # Proxy card
+        cf = self._rounded_card(outer, title="Прокси")
+        cf.pack(fill="x", pady=(0, 12))
+        cbar = tk.Frame(cf.content, bg=COLORS["panel"])
+        cbar.pack(fill="x")
+        self.btn_connect = RoundButton(cbar, text="Подключить", variant="accent", command=self.connect)
+        self.btn_connect.pack(side="left", padx=(0, 6))
+        self.btn_disconnect = RoundButton(cbar, text="Отключить", variant="default", command=self.disconnect)
+        self.btn_disconnect.pack(side="left", padx=(0, 6))
+        self.btn_disconnect.set_state("disabled")
+        RoundButton(cbar, text="Тест ключа", variant="default", command=self.test_key).pack(side="left", padx=(0, 6))
+        RoundButton(cbar, text="Проверить IP", variant="default", command=self.check_ip).pack(side="left", padx=(0, 6))
+        RoundButton(cbar, text="Запущенные приложения", variant="default", command=self.show_apps_dialog).pack(side="right")
+
+        # Launch card
+        lf = self._rounded_card(outer, title="Запустить через прокси выделенного ключа")
+        lf.pack(fill="x", pady=(0, 12))
+        self.launch_frame = tk.Frame(lf.content, bg=COLORS["panel"])
+        self.launch_frame.pack(fill="x")
+        self._build_launch_buttons()
+
+        # Log card — compact footer; full log opens in a separate window
+        log_card = self._rounded_card(outer)
+        log_card.pack(fill="x", pady=(0, 0))
+        log_row = tk.Frame(log_card.content, bg=COLORS["panel"])
+        log_row.pack(fill="x")
+        tk.Label(log_row, text="Лог", bg=COLORS["panel"], fg=COLORS["muted"],
+                 font=UI_FONT_BOLD).pack(side="left")
+        self._log_count_label = tk.Label(log_row, text="0 строк", bg=COLORS["panel"],
+                                         fg=COLORS["muted"], font=UI_FONT)
+        self._log_count_label.pack(side="left", padx=10)
+        RoundButton(log_row, text="Открыть в окне", variant="tool",
+                    command=self.open_log_window).pack(side="right")
+
+    def _rounded_card(self, parent, title: str | None = None) -> RoundedCard:
+        card = RoundedCard(parent, radius=18, fill=COLORS["panel"])
+        card.body.configure(bg=COLORS["panel"])
+        if title:
+            head = tk.Frame(card.body, bg=COLORS["panel"])
+            head.pack(fill="x", padx=18, pady=(14, 4))
+            tk.Label(head, text=title, bg=COLORS["panel"], fg=COLORS["muted"],
+                     font=UI_FONT_BOLD).pack(side="left")
+        content = tk.Frame(card.body, bg=COLORS["panel"])
+        content.pack(fill="both", expand=True, padx=18, pady=(4, 14))
+        card.content = content  # type: ignore[attr-defined]
+        return card
+
+    def _build_launch_buttons(self):
+        for w in self.launch_frame.winfo_children():
+            w.destroy()
+        for name, cmd in detect_apps():
+            RoundButton(self.launch_frame, text=name, variant="tool",
+                        command=lambda c=cmd, n=name: self.launch_app(n, c)).pack(side="left", padx=(0, 6), pady=2)
+        RoundButton(self.launch_frame, text="Custom…", variant="tool",
+                    command=self.launch_custom).pack(side="left", padx=(0, 6), pady=2)
+        RoundButton(self.launch_frame, text="git proxy on", variant="tool",
+                    command=lambda: self.toggle_git_proxy(True)).pack(side="left", padx=(14, 6), pady=2)
+        RoundButton(self.launch_frame, text="git proxy off", variant="tool",
+                    command=lambda: self.toggle_git_proxy(False)).pack(side="left", padx=(0, 6), pady=2)
+
+    # ---- key management ----
+
+    def refresh_keys(self):
+        prev = self.tree.selection()
+        prev_id = prev[0] if prev else None
+        self.tree.delete(*self.tree.get_children())
+        keys = list_keys()
+        for k in keys:
+            p = self.proxies.get(k["name"])
+            if p and p["proc"].poll() is None:
+                status = f"●  :{p['addr'].split(':')[1]}"
+            else:
+                status = "○ не подключён"
+            self.tree.insert("", "end", iid=k["name"], values=(status, k["name"], k["tag"], k["server"], k["port"]))
+        if keys:
+            if prev_id and self.tree.exists(prev_id):
+                self.tree.selection_set(prev_id)
+            else:
+                self.tree.selection_set(self.tree.get_children()[0])
+            self.empty_hint.pack_forget()
+        else:
+            self.empty_hint.pack(fill="x", padx=8, pady=4, before=self.tree)
+        self._update_status_display()
+
+    def selected_key(self) -> dict | None:
+        sel = self.tree.selection()
+        if not sel:
+            return None
+        for k in list_keys():
+            if k["name"] == sel[0]:
+                return k
+        return None
+
+    def _save_key(self, data: dict, default_name: str) -> bool:
+        name = simpledialog.askstring("Имя ключа", "Сохранить как (без .json):", initialvalue=slugify(default_name), parent=self)
+        if not name:
+            return False
+        name = slugify(name)
+        path = KEYS_DIR / f"{name}.json"
+        if path.exists():
+            if not messagebox.askyesno("Перезаписать?", f"Файл {path.name} уже есть. Заменить?"):
+                return False
+        KEYS_DIR.mkdir(exist_ok=True)
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        self.log_msg(f"saved key → {path}")
+        self.refresh_keys()
+        try:
+            self.tree.selection_set(name)
+        except Exception:
+            pass
+        return True
+
+    def add_ssconf(self):
+        url = self._ask_string_with_paste(
+            "Добавить ssconf://",
+            "Вставь ссылку ssconf:// от провайдера VPN.\n"
+            "Можно Ctrl+V или нажать кнопку «Вставить из буфера».",
+        )
+        if not url:
+            return
+        url = url.strip()
+        try:
+            data = fetch_ssconf(url)
+        except Exception as e:
+            messagebox.showerror("Ошибка", f"Не удалось скачать: {e}")
+            return
+        data["_ssconf_url"] = url
+        default = data.get("tag") or url.rstrip("/").split("/")[-1] or "ssconf"
+        self._save_key(data, default)
+
+    def _ask_string_with_paste(self, title: str, prompt: str, initial: str = "") -> str | None:
+        """Custom replacement for simpledialog.askstring with a paste button.
+        simpledialog.askstring sometimes hangs on Ctrl+V in Windows due to
+        clipboard format negotiation (HTML/RTF in clipboard); this version
+        reads clipboard content directly via Tk and offers a button.
+        """
+        win = tk.Toplevel(self)
+        win.title(title)
+        win.transient(self)
+        win.grab_set()
+        win.geometry("520x180")
+        win.resizable(True, False)
+
+        ttk.Label(win, text=prompt, justify="left", wraplength=480).pack(fill="x", padx=12, pady=(12, 6))
+
+        var = tk.StringVar(value=initial)
+        entry = ttk.Entry(win, textvariable=var, width=80)
+        entry.pack(fill="x", padx=12, pady=4)
+        entry.focus_set()
+
+        result = {"value": None}
+
+        def do_paste():
+            try:
+                # Read clipboard via Tk (avoids tkinter's slow Ctrl+V path on some systems)
+                clip = self.clipboard_get()
+                var.set(clip.strip())
+            except tk.TclError:
+                messagebox.showinfo("Буфер обмена", "В буфере нет текста.", parent=win)
+
+        def ok():
+            result["value"] = var.get()
+            win.destroy()
+
+        def cancel():
+            win.destroy()
+
+        bar = ttk.Frame(win)
+        bar.pack(fill="x", padx=12, pady=10)
+        ttk.Button(bar, text="Вставить из буфера", command=do_paste).pack(side="left")
+        ttk.Button(bar, text="OK", command=ok).pack(side="right", padx=(4, 0))
+        ttk.Button(bar, text="Cancel", command=cancel).pack(side="right")
+
+        entry.bind("<Return>", lambda _e: ok())
+        win.bind("<Escape>", lambda _e: cancel())
+
+        win.wait_window()
+        return result["value"]
+
+    def add_json(self):
+        win = tk.Toplevel(self)
+        win.title("Вставь JSON ключа")
+        win.geometry("520x320")
+        txt = scrolledtext.ScrolledText(win, font=("Courier", 9))
+        txt.pack(fill="both", expand=True, padx=8, pady=8)
+        txt.insert("1.0", '{\n  "method": "chacha20-ietf-poly1305",\n  "password": "...",\n  "server": "1.2.3.4",\n  "server_port": 443,\n  "tag": "Country"\n}\n')
+        def save():
+            try:
+                data = parse_json_text(txt.get("1.0", "end"))
+            except Exception as e:
+                messagebox.showerror("Ошибка", f"JSON не парсится: {e}")
+                return
+            win.destroy()
+            self._save_key(data, data.get("tag") or "key")
+        ttk.Button(win, text="Сохранить", command=save).pack(pady=6)
+
+    def add_file(self):
+        f = filedialog.askopenfilename(title="JSON-ключ", filetypes=[("JSON", "*.json"), ("All", "*.*")])
+        if not f:
+            return
+        try:
+            raw = Path(f).read_bytes()
+            data = json.loads(sanitize_json_bytes(raw).decode("utf-8", errors="replace"))
+        except Exception as e:
+            messagebox.showerror("Ошибка", f"Не парсится: {e}")
+            return
+        self._save_key(data, data.get("tag") or Path(f).stem)
+
+    def clone_key(self):
+        k = self.selected_key()
+        if not k:
+            messagebox.showwarning("Выбери ключ", "Сначала выбери ключ для клонирования.")
+            return
+        # generate next free name: name-2, name-3 ...
+        base = k["name"]
+        i = 2
+        while True:
+            candidate = f"{base}-{i}"
+            if not (KEYS_DIR / f"{candidate}.json").exists():
+                break
+            i += 1
+        try:
+            data = json.loads(sanitize_json_bytes(k["path"].read_bytes()).decode("utf-8", errors="replace"))
+        except Exception as e:
+            messagebox.showerror("Ошибка", f"Не парсится исходный ключ: {e}")
+            return
+        new_path = KEYS_DIR / f"{candidate}.json"
+        new_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        self.log_msg(f"клонирован {base} → {candidate}")
+        self.refresh_keys()
+        self._reselect(candidate)
+        messagebox.showinfo(
+            "Клонирован",
+            f"Создан {candidate}.json — копия {base}.\n\n"
+            "Если хочешь поставить на него другой регион — выдели его в списке и нажми «сменить регион»."
+        )
+
+    def show_apps_dialog(self):
+        k = self.selected_key()
+        if not k:
+            messagebox.showinfo("Выбери ключ", "Сначала выдели ключ.")
+            return
+        win = tk.Toplevel(self)
+        win.title(f"Приложения через «{k['name']}»")
+        win.geometry("560x360")
+        win.transient(self)
+        apply_theme(win)
+        win.configure(bg=COLORS["bg"])
+
+        outer = ttk.Frame(win, padding=14)
+        outer.pack(fill="both", expand=True)
+
+        p = self.proxies.get(k["name"])
+        if p and p["proc"].poll() is None:
+            ttk.Label(outer, text=f"{k['tag'] or k['name']}  ·  http://{p['addr']}",
+                      style="Title.TLabel").pack(anchor="w", pady=(0, 6))
+        else:
+            ttk.Label(outer, text=f"{k['tag'] or k['name']}", style="Title.TLabel").pack(anchor="w", pady=(0, 6))
+            ttk.Label(outer, text="Прокси не запущен", style="Muted.TLabel").pack(anchor="w")
+
+        cols = ("when", "name", "pid", "alive")
+        tree = ttk.Treeview(outer, columns=cols, show="headings", height=10, selectmode="browse")
+        for c, label, w, anchor in [("when", "запущено", 110, "w"), ("name", "приложение", 200, "w"),
+                                    ("pid", "PID", 80, "e"), ("alive", "статус", 110, "w")]:
+            tree.heading(c, text=label)
+            tree.column(c, width=w, anchor=anchor)
+        tree.pack(fill="both", expand=True, pady=(8, 8))
+
+        apps = (p or {}).get("apps", []) if p else []
+        if not apps:
+            ttk.Label(outer, text="Приложений ещё не запускалось через этот прокси.\n"
+                                  "Подключи прокси и жми кнопки в панели «Запустить через прокси».",
+                      style="Muted.TLabel", justify="left").pack(anchor="w")
+        else:
+            for entry in apps:
+                proc = entry.get("proc")
+                alive = "● работает" if proc and proc.poll() is None else "○ завершено"
+                tree.insert("", "end", values=(entry["time"], entry["name"], entry.get("pid", "?"), alive))
+
+        bar = ttk.Frame(outer)
+        bar.pack(fill="x")
+        ttk.Button(bar, text="Обновить", style="Tool.TButton",
+                   command=lambda: (win.destroy(), self.show_apps_dialog())).pack(side="left")
+        ttk.Button(bar, text="Закрыть", style="Tool.TButton", command=win.destroy).pack(side="right")
+
+    def delete_key(self):
+        k = self.selected_key()
+        if not k:
+            return
+        if not messagebox.askyesno("Удалить?", f"Удалить ключ {k['name']}?"):
+            return
+        try:
+            k["path"].unlink()
+            self.log_msg(f"deleted {k['path'].name}")
+        except Exception as e:
+            messagebox.showerror("Ошибка", str(e))
+        self.refresh_keys()
+
+    def change_region(self):
+        k = self.selected_key()
+        if not k:
+            messagebox.showwarning("Выбери ключ", "Сначала выбери ключ из списка.")
+            return
+        # read raw JSON to get _ssconf_url
+        try:
+            raw = json.loads(sanitize_json_bytes(k["path"].read_bytes()).decode("utf-8", errors="replace"))
+        except Exception as e:
+            messagebox.showerror("Ошибка", f"Не парсится ключ: {e}")
+            return
+        ssconf_url = raw.get("_ssconf_url", "")
+        if not ssconf_url:
+            ssconf_url = simpledialog.askstring(
+                "Сменить регион",
+                f"У ключа {k['name']} не сохранена исходная ssconf://-ссылка.\n"
+                "Вставь её сюда (она нужна для запроса списка регионов у провайдера):",
+                parent=self,
+            )
+            if not ssconf_url:
+                return
+            ssconf_url = ssconf_url.strip()
+            raw["_ssconf_url"] = ssconf_url
+            k["path"].write_text(json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        threading.Thread(target=self._open_region_dialog, args=(k, ssconf_url), daemon=True).start()
+
+    def _open_region_dialog(self, k: dict, ssconf_url: str):
+        try:
+            locations = fetch_provider_locations(ssconf_url)
+        except Exception as e:
+            self.after(0, lambda: messagebox.showerror("Регионы", f"Не удалось получить список:\n{e}"))
+            return
+        # filter out systemLocation entries
+        visible = [loc for loc in locations if not loc.get("systemLocation")]
+        if not visible:
+            self.after(0, lambda: messagebox.showinfo("Регионы", "Провайдер не вернул ни одного публичного региона."))
+            return
+        self.after(0, lambda: self._render_region_dialog(k, ssconf_url, visible))
+
+    def _render_region_dialog(self, k: dict, ssconf_url: str, locations: list):
+        win = tk.Toplevel(self)
+        win.title(f"Сменить регион — {k['name']}")
+        win.geometry("520x420")
+        win.transient(self)
+
+        ttk.Label(win, text=f"Текущий регион: {k['tag']}", anchor="w").pack(fill="x", padx=10, pady=(10, 4))
+        ttk.Label(win, text="Выбери регион из списка провайдера и нажми «Применить».", foreground="#888").pack(fill="x", padx=10)
+
+        list_frame = ttk.Frame(win)
+        list_frame.pack(fill="both", expand=True, padx=10, pady=8)
+        scroll = ttk.Scrollbar(list_frame, orient="vertical")
+        listbox = tk.Listbox(list_frame, yscrollcommand=scroll.set, font=("TkDefaultFont", 10))
+        scroll.config(command=listbox.yview)
+        scroll.pack(side="right", fill="y")
+        listbox.pack(side="left", fill="both", expand=True)
+
+        # sort: best first, then by description
+        locations.sort(key=lambda l: (not l.get("bestLocation"), l.get("description", "")))
+        for i, loc in enumerate(locations):
+            label = loc.get("description", "?")
+            if loc.get("bestLocation"):
+                label = "★ (быстрый)  " + label
+            speed = loc.get("speed")
+            if speed:
+                label += f"   ~{speed} ms"
+            listbox.insert("end", label)
+            if loc.get("description") == k["tag"]:
+                listbox.selection_set(i)
+                listbox.see(i)
+        if not listbox.curselection() and locations:
+            listbox.selection_set(0)
+
+        bar = ttk.Frame(win)
+        bar.pack(fill="x", padx=10, pady=(0, 10))
+
+        def apply():
+            sel = listbox.curselection()
+            if not sel:
+                return
+            chosen = locations[sel[0]]
+            apply_btn.configure(state="disabled", text="меняю…")
+            threading.Thread(target=self._apply_region_change, args=(k, ssconf_url, chosen, win, apply_btn), daemon=True).start()
+
+        apply_btn = ttk.Button(bar, text="Применить", command=apply)
+        apply_btn.pack(side="left")
+        ttk.Button(bar, text="Закрыть", command=win.destroy).pack(side="right")
+
+    def _apply_region_change(self, k: dict, ssconf_url: str, chosen: dict, dialog: tk.Toplevel, btn):
+        existing = self.proxies.get(k["name"])
+        was_running = bool(existing and existing["proc"].poll() is None)
+        try:
+            resp = change_provider_location(ssconf_url, chosen["value"])
+            self.log_msg(f"{k['name']}: смена региона → {resp.get('tag', chosen.get('description'))}")
+            new_data = fetch_ssconf(ssconf_url)
+            new_data["_ssconf_url"] = ssconf_url
+            k["path"].write_text(json.dumps(new_data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+            def finish():
+                self.refresh_keys()
+                self._reselect(k["name"])
+                dialog.destroy()
+                if was_running:
+                    self.log_msg(f"{k['name']}: перезапускаю прокси на новом регионе…")
+                    self._stop_proxy_for(k["name"])
+                    self.after(500, self.connect)
+                else:
+                    messagebox.showinfo("Регион сменён", f"Теперь: {new_data.get('tag', chosen.get('description'))}")
+            self.after(0, finish)
+        except Exception as e:
+            self.after(0, lambda: (
+                btn.configure(state="normal", text="Применить"),
+                messagebox.showerror("Ошибка", f"Не получилось сменить регион:\n{e}"),
+            ))
+
+    def _reselect(self, name: str):
+        try:
+            self.tree.selection_set(name)
+        except Exception:
+            pass
+
+    def _on_theme_change(self):
+        mode = self.theme_var.get()
+        self.theme_mode = mode
+        self.settings["theme"] = mode
+        save_settings(self.settings)
+        self.actual_theme = apply_theme(self, mode)
+        self.log_msg(f"тема: {mode} (фактически {self.actual_theme})")
+        # Re-build the entire UI to pick up new palette (cleanest approach)
+        for w in self.winfo_children():
+            w.destroy()
+        self._build_ui()
+        self.refresh_keys()
+        self._update_status_display()
+        apply_dark_titlebar(self, self.actual_theme == "dark")
+
+    def open_keys_dir(self):
+        KEYS_DIR.mkdir(exist_ok=True)
+        if IS_WIN:
+            os.startfile(str(KEYS_DIR))  # type: ignore[attr-defined]
+        elif IS_MAC:
+            subprocess.Popen(["open", str(KEYS_DIR)])
+        else:
+            subprocess.Popen(["xdg-open", str(KEYS_DIR)])
+
+    # ---- proxy control ----
+
+    def _used_local_ports(self) -> set:
+        used = set()
+        for v in self.proxies.values():
+            try:
+                used.add(int(v["addr"].split(":")[1]))
+            except (KeyError, ValueError, IndexError):
+                pass
+        return used
+
+    def _on_select_key(self):
+        self._update_status_display()
+
+    def _update_status_display(self):
+        sel = self.selected_key()
+        if not sel:
+            self.status_dot.configure(fg="#888")
+            self.status_text.configure(text="выбери ключ")
+            return
+        p = self.proxies.get(sel["name"])
+        if p and p["proc"].poll() is None:
+            self.status_dot.configure(fg="#26C6DA")
+            self.status_text.configure(text=f"  {sel['name']}: {p['key_tag']} → http://{p['addr']}")
+            self.btn_connect.configure(state="disabled")
+            self.btn_disconnect.configure(state="normal")
+        else:
+            self.status_dot.configure(fg="#888")
+            running = len([1 for x in self.proxies.values() if x["proc"].poll() is None])
+            extra = f"   ·   ещё запущено: {running}" if running else ""
+            self.status_text.configure(text=f"  {sel['name']} не подключён{extra}")
+            self.btn_connect.configure(state="normal")
+            self.btn_disconnect.configure(state="disabled")
+
+    def _start_proxy_subprocess(self, key_name: str, addr: str) -> subprocess.Popen | None:
+        cmd = go_command() + ["-key", key_name, "-no-menu", "-addr", addr]
+        self.log_msg(f"$ {' '.join(cmd)}")
+        try:
+            popen_kwargs = dict(
+                cwd=str(SCRIPT_DIR),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                bufsize=1,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+            if IS_WIN:
+                popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
+            proc = subprocess.Popen(cmd, **popen_kwargs)
+        except FileNotFoundError as e:
+            messagebox.showerror("Ошибка", f"Не удалось запустить: {e}\n\nУбедись что vpn-proxy.exe рядом или Go установлен.")
+            return None
+        threading.Thread(target=self._pump_log, args=(proc,), daemon=True).start()
+        self.proxy_addr = addr
+        return proc
+
+    def connect(self):
+        k = self.selected_key()
+        if not k:
+            messagebox.showwarning("Выбери ключ", "Сначала выбери ключ из списка.")
+            return
+        existing = self.proxies.get(k["name"])
+        if existing and existing["proc"].poll() is None:
+            messagebox.showinfo("Уже подключён", f"{k['name']} уже работает на {existing['addr']}.")
+            return
+        # find a free port avoiding ports already used by other running proxies
+        free = find_free_port("127.0.0.1", 8080, avoid=self._used_local_ports())
+        addr = f"127.0.0.1:{free}"
+        proc = self._start_proxy_subprocess(k["name"], addr)
+        if not proc:
+            return
+        self.proxies[k["name"]] = {"proc": proc, "addr": addr, "key_tag": k["tag"] or k["name"]}
+        self._update_status_display()
+        threading.Thread(target=self._wait_listening, args=(proc, k, addr), daemon=True).start()
+
+    def _wait_listening(self, proc: subprocess.Popen, k: dict, addr: str):
+        marker = f"listening on http://{addr}"
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            if proc.poll() is not None:
+                self.after(0, lambda: self._on_proxy_died(k["name"], "exited before listening"))
+                return
+            if marker in "".join(self._log_buffer):
+                self.after(0, lambda: (self.refresh_keys(), self._reselect(k["name"]), self._update_status_display()))
+                return
+            time.sleep(0.2)
+        self.after(0, lambda: self._on_proxy_died(k["name"], "timed out waiting for proxy"))
+
+    def _on_proxy_died(self, key_name: str, reason: str = ""):
+        self.proxies.pop(key_name, None)
+        if reason:
+            self.log_msg(f"{key_name}: {reason}")
+        self.refresh_keys()
+        self._reselect(key_name)
+        self._update_status_display()
+
+    def disconnect(self):
+        k = self.selected_key()
+        if not k:
+            return
+        self._stop_proxy_for(k["name"])
+        self._update_status_display()
+
+    def _stop_proxy_for(self, key_name: str):
+        p = self.proxies.pop(key_name, None)
+        if not p:
+            return
+        proc = p["proc"]
+        if proc.poll() is None:
+            try:
+                if IS_WIN:
+                    proc.send_signal(signal.CTRL_BREAK_EVENT)  # type: ignore[attr-defined]
+                else:
+                    proc.send_signal(signal.SIGINT)
+            except (OSError, ValueError):
+                pass
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=2)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+        self.refresh_keys()
+
+    def _poll_procs(self):
+        died = [name for name, p in self.proxies.items() if p["proc"].poll() is not None]
+        for name in died:
+            code = self.proxies[name]["proc"].returncode
+            self.log_msg(f"{name}: proxy exited (code {code})")
+            self.proxies.pop(name, None)
+        if died:
+            self.refresh_keys()
+            self._update_status_display()
+        self.after(500, self._poll_procs)
+
+    def test_key(self):
+        k = self.selected_key()
+        if not k:
+            messagebox.showwarning("Выбери ключ", "Сначала выбери ключ.")
+            return
+        threading.Thread(target=self._test_key_thread, args=(k,), daemon=True).start()
+
+    def _test_key_thread(self, k: dict):
+        self.log_msg(f"--- testing {k['name']} ---")
+        # use a different port to not collide with running proxy
+        addr = "127.0.0.1:18081"
+        cmd = go_command() + ["-key", k["name"], "-no-menu", "-addr", addr]
+        try:
+            popen_kwargs = dict(cwd=str(SCRIPT_DIR), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=1, text=True, encoding="utf-8", errors="replace")
+            if IS_WIN:
+                popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
+            proc = subprocess.Popen(cmd, **popen_kwargs)
+        except Exception as e:
+            self.log_msg(f"test failed to start: {e}")
+            return
+        threading.Thread(target=self._pump_log, args=(proc,), daemon=True).start()
+        # wait listening
+        deadline = time.time() + 10
+        ok = False
+        while time.time() < deadline:
+            if proc.poll() is not None:
+                break
+            if "listening" in "".join(self._log_buffer):
+                ok = True
+                break
+            time.sleep(0.2)
+        if not ok:
+            self.log_msg("test: proxy did not start")
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+            return
+        # try fetching IP
+        try:
+            t0 = time.time()
+            ip = http_get_via_proxy("https://api.ipify.org", f"http://{addr}", timeout=10)
+            dt = (time.time() - t0) * 1000
+            msg = f"test {k['name']}: OK, exit IP {ip} ({dt:.0f} ms)"
+            self.log_msg(msg)
+            self.after(0, lambda: messagebox.showinfo("Тест", f"{k['tag'] or k['name']}\nexit IP: {ip}\nlatency: {dt:.0f} ms"))
+        except Exception as e:
+            self.log_msg(f"test {k['name']}: FAIL ({e})")
+            self.after(0, lambda: messagebox.showerror("Тест", f"{k['name']}: {e}"))
+        finally:
+            try:
+                if IS_WIN:
+                    proc.send_signal(signal.CTRL_BREAK_EVENT)  # type: ignore[attr-defined]
+                else:
+                    proc.send_signal(signal.SIGINT)
+                proc.wait(timeout=3)
+            except Exception:
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+
+    def check_ip(self):
+        sel = self.selected_key()
+        active = self.proxies.get(sel["name"]) if sel else None
+        if not active or active["proc"].poll() is not None:
+            messagebox.showinfo("Не подключено", "Выделенный ключ не подключён.")
+            return
+        threading.Thread(target=self._check_ip_thread, args=(sel["name"], active["addr"]), daemon=True).start()
+
+    def _check_ip_thread(self, key_name: str, addr: str):
+        try:
+            ip = http_get_via_proxy("https://api.ipify.org", f"http://{addr}", timeout=10)
+            self.log_msg(f"{key_name}: exit IP = {ip}")
+            self.after(0, lambda: messagebox.showinfo("Текущий IP", f"{key_name}: {ip}"))
+        except Exception as e:
+            self.log_msg(f"{key_name}: check_ip failed: {e}")
+            self.after(0, lambda: messagebox.showerror("Ошибка", str(e)))
+
+    # ---- launch ----
+
+    def launch_app(self, name: str, cmd: list):
+        sel = self.selected_key()
+        active = self.proxies.get(sel["name"]) if sel else None
+        if not active or active["proc"].poll() is not None:
+            # try fallback to ANY running proxy
+            running = [(k, v) for k, v in self.proxies.items() if v["proc"].poll() is None]
+            if running:
+                if not messagebox.askyesno(
+                    "Выделенный ключ не подключён",
+                    f"У ключа '{sel['name'] if sel else '?'}' нет активного прокси.\n\n"
+                    f"Использовать прокси от '{running[0][0]}' ({running[0][1]['key_tag']})?",
+                ):
+                    return
+                active = running[0][1]
+            else:
+                if not messagebox.askyesno("Прокси не запущен", "Запустить программу без прокси?"):
+                    return
+                env = os.environ.copy()
+                try:
+                    subprocess.Popen(cmd, env=env)
+                    self.log_msg(f"launched {name} (без прокси)")
+                except Exception as e:
+                    messagebox.showerror("Ошибка", f"Не удалось запустить {name}: {e}")
+                return
+
+        proxy_url = f"http://{active['addr']}"
+        env = proxy_env(proxy_url)
+        name_lower = name.lower()
+        chromium_brands = {"chrome", "edge", "chromium", "brave", "opera", "yandex", "vivaldi", "cursor", "vscode"}
+        # Cursor and VSCode are Electron — they USE Chromium. They respect env vars in code,
+        # but the bundled browser (webview) inside also benefits from --proxy-server.
+        # However VSCode/Cursor reads http.proxy from settings.json and env, so leave them as env-only.
+        chromium_browsers = {"chrome", "edge", "chromium", "brave", "opera", "yandex", "vivaldi"}
+
+        try:
+            if name_lower in chromium_browsers:
+                final_cmd = self._chromium_cmd_with_proxy(cmd, proxy_url, name_lower)
+            elif name_lower == "firefox":
+                final_cmd = self._firefox_cmd_with_proxy(cmd, proxy_url)
+            elif name_lower == "safari":
+                messagebox.showinfo("Safari", "Safari использует системные настройки прокси. "
+                                   "Открой System Settings → Network → активное подключение → "
+                                   "Details → Proxies → HTTPS Proxy → " + proxy_url)
+                final_cmd = cmd
+            else:
+                final_cmd = cmd
+            child = subprocess.Popen(final_cmd, env=env)
+            self.log_msg(f"запустил {name}: PID {child.pid}, через {proxy_url}")
+            # Track this app under the proxy's apps list (so the apps dialog can show it)
+            owner_key = None
+            for k_name, p in self.proxies.items():
+                if p is active:
+                    owner_key = k_name
+                    break
+            if owner_key:
+                self.proxies[owner_key].setdefault("apps", []).append({
+                    "name": name,
+                    "pid": child.pid,
+                    "proc": child,
+                    "time": time.strftime("%H:%M:%S"),
+                })
+        except Exception as e:
+            messagebox.showerror("Ошибка", f"Не удалось запустить {name}: {e}")
+
+    def _chromium_cmd_with_proxy(self, base_cmd: list, proxy_url: str, brand: str) -> list:
+        """Launch Chromium-based browser with isolated profile that actually uses the proxy."""
+        import tempfile
+        user_data = Path(tempfile.gettempdir()) / f"vpn-proxy-{brand}"
+        user_data.mkdir(exist_ok=True)
+        # base_cmd is e.g. [chrome.exe] or ["open", "-na", "Chrome.app"]
+        # Chrome flags need to come AFTER any "open -na <app> --args" wrapper
+        if base_cmd and base_cmd[0] in ("open",):
+            # macOS: open -na "App.app" --args <chrome flags>
+            return base_cmd + ["--args",
+                               f"--proxy-server={proxy_url}",
+                               f"--user-data-dir={user_data}",
+                               "--no-first-run",
+                               "--no-default-browser-check",
+                               "--proxy-bypass-list=<-loopback>"]
+        # Windows / Linux: direct exe
+        return [base_cmd[0],
+                f"--proxy-server={proxy_url}",
+                f"--user-data-dir={user_data}",
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--proxy-bypass-list=<-loopback>"]
+
+    def _firefox_cmd_with_proxy(self, base_cmd: list, proxy_url: str) -> list:
+        """Firefox: build a temp profile with user.js that points at our proxy."""
+        import tempfile
+        from urllib.parse import urlparse
+        prof = Path(tempfile.gettempdir()) / "vpn-proxy-firefox"
+        prof.mkdir(exist_ok=True)
+        u = urlparse(proxy_url)
+        host = u.hostname or "127.0.0.1"
+        port = u.port or 8080
+        user_js = prof / "user.js"
+        user_js.write_text(
+            f'user_pref("network.proxy.type", 1);\n'
+            f'user_pref("network.proxy.http", "{host}");\n'
+            f'user_pref("network.proxy.http_port", {port});\n'
+            f'user_pref("network.proxy.ssl", "{host}");\n'
+            f'user_pref("network.proxy.ssl_port", {port});\n'
+            f'user_pref("network.proxy.share_proxy_settings", true);\n'
+            f'user_pref("network.proxy.no_proxies_on", "localhost,127.0.0.1");\n'
+            f'user_pref("browser.shell.checkDefaultBrowser", false);\n',
+            encoding="utf-8",
+        )
+        if base_cmd and base_cmd[0] in ("open",):
+            return base_cmd + ["--args", "-no-remote", "-profile", str(prof)]
+        return [base_cmd[0], "-no-remote", "-profile", str(prof)]
+
+    def launch_custom(self):
+        f = filedialog.askopenfilename(title="Программа")
+        if f:
+            self.launch_app(Path(f).name, [f])
+
+    def toggle_git_proxy(self, on: bool):
+        try:
+            if on:
+                proxy = f"http://{self.proxy_addr}"
+                subprocess.run(["git", "config", "--global", "http.proxy", proxy], check=True)
+                subprocess.run(["git", "config", "--global", "https.proxy", proxy], check=True)
+                self.log_msg(f"git: http.proxy={proxy} (global)")
+                messagebox.showinfo("git", f"Все git-команды теперь через {proxy}.\nНе забудь выключить, когда наскучит.")
+            else:
+                subprocess.run(["git", "config", "--global", "--unset", "http.proxy"])
+                subprocess.run(["git", "config", "--global", "--unset", "https.proxy"])
+                self.log_msg("git: proxy unset")
+                messagebox.showinfo("git", "git proxy выключен.")
+        except FileNotFoundError:
+            messagebox.showerror("Ошибка", "git не найден в PATH.")
+
+    # ---- log / status ----
+
+    def _pump_log(self, proc: subprocess.Popen):
+        if proc.stdout is None:
+            return
+        for line in proc.stdout:
+            self.log_msg(line.rstrip())
+
+    def log_msg(self, line: str):
+        ts = time.strftime("%H:%M:%S")
+        msg = f"[{ts}] {line}\n"
+        try:
+            self.after(0, self._log_append, msg)
+        except RuntimeError:
+            pass
+
+    def _log_append(self, msg: str):
+        self._log_buffer.append(msg)
+        # cap buffer at last 5000 lines
+        if len(self._log_buffer) > 5000:
+            self._log_buffer = self._log_buffer[-5000:]
+        try:
+            self._log_count_label.configure(text=f"{len(self._log_buffer)} строк")
+        except Exception:
+            pass
+        # if popup is open, append there
+        if self._log_window is not None and self._log_window.winfo_exists():
+            try:
+                w = self._log_window.log_widget  # type: ignore[attr-defined]
+                w.configure(state="normal")
+                w.insert("end", msg)
+                w.see("end")
+                w.configure(state="disabled")
+            except Exception:
+                pass
+
+    def open_log_window(self):
+        if self._log_window is not None and self._log_window.winfo_exists():
+            self._log_window.lift()
+            self._log_window.focus_force()
+            return
+        win = tk.Toplevel(self)
+        win.title(f"{APP_NAME} — лог")
+        win.geometry("780x500")
+        win.configure(bg=COLORS["bg"])
+        # Apply dark titlebar to popup too
+        win.after(50, lambda: apply_dark_titlebar(win, self.actual_theme == "dark"))
+
+        outer = tk.Frame(win, bg=COLORS["bg"])
+        outer.pack(fill="both", expand=True, padx=14, pady=14)
+
+        card = RoundedCard(outer, radius=14, fill=COLORS["panel"])
+        card.pack(fill="both", expand=True)
+        card.body.configure(bg=COLORS["panel"])
+
+        toolbar = tk.Frame(card.body, bg=COLORS["panel"])
+        toolbar.pack(fill="x", padx=14, pady=(12, 6))
+        tk.Label(toolbar, text="Лог", bg=COLORS["panel"], fg=COLORS["muted"],
+                 font=UI_FONT_BOLD).pack(side="left")
+        RoundButton(toolbar, text="Очистить", variant="tool",
+                    command=lambda: self._clear_log()).pack(side="right")
+        RoundButton(toolbar, text="Скопировать всё", variant="tool",
+                    command=lambda: self._copy_log()).pack(side="right", padx=(0, 6))
+
+        log_widget = scrolledtext.ScrolledText(
+            card.body, font=UI_FONT_MONO,
+            background=COLORS["bg"], foreground=COLORS["text"],
+            insertbackground=COLORS["accent"], borderwidth=0, relief="flat",
+            wrap="none",
+        )
+        log_widget.pack(fill="both", expand=True, padx=14, pady=(0, 14))
+        log_widget.insert("end", "".join(self._log_buffer))
+        log_widget.see("end")
+        log_widget.configure(state="disabled")
+
+        win.log_widget = log_widget  # type: ignore[attr-defined]
+        self._log_window = win
+
+        def on_close():
+            self._log_window = None
+            win.destroy()
+        win.protocol("WM_DELETE_WINDOW", on_close)
+
+    def _clear_log(self):
+        self._log_buffer.clear()
+        self._log_count_label.configure(text="0 строк")
+        if self._log_window is not None and self._log_window.winfo_exists():
+            w = self._log_window.log_widget  # type: ignore[attr-defined]
+            w.configure(state="normal")
+            w.delete("1.0", "end")
+            w.configure(state="disabled")
+
+    def _copy_log(self):
+        text = "".join(self._log_buffer)
+        self.clipboard_clear()
+        self.clipboard_append(text)
+
+    def _set_status(self, color: str, text: str):
+        colors = {"green": "#2ca02c", "yellow": "#dca40a", "red": "#d62728", "grey": "#888888"}
+        self.status_dot.configure(fg=colors.get(color, "#888"))
+        self.status_text.configure(text=text)
+
+
+def setup_windows_dpi():
+    """Tell Windows we render our own DPI — fixes blurry text on high-DPI screens.
+    Must be called BEFORE creating any tk.Tk()."""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        try:
+            # Per-Monitor v2 (Windows 10 1703+) — best
+            ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
+            return
+        except (OSError, AttributeError):
+            pass
+        try:
+            # Per-monitor v1 (Windows 8.1+)
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)
+            return
+        except (OSError, AttributeError):
+            pass
+        # System-DPI fallback (Vista+)
+        ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
+
+
+def setup_windows_taskbar_id():
+    """Claim a unique AppUserModelID so the taskbar shows our icon and doesn't
+    group us under pythonw.exe."""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            "local.zubritunnel.gui"
+        )
+    except Exception:
+        pass
+
+
+def main():
+    setup_windows_dpi()
+    setup_windows_taskbar_id()
+    KEYS_DIR.mkdir(exist_ok=True)
+    app = App()
+    def on_close():
+        for name in list(app.proxies.keys()):
+            try:
+                app._stop_proxy_for(name)
+            except Exception:
+                pass
+        app.destroy()
+    app.protocol("WM_DELETE_WINDOW", on_close)
+    app.mainloop()
+
+
+if __name__ == "__main__":
+    main()

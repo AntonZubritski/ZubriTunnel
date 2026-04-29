@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Лаунчер ZubriTunnel.app — должен лежать рядом с gui.py
+# (если переносишь .app в /Applications, рабочая папка mac/ должна остаться на месте)
+
+set -e
+
+# определяем путь к рабочей папке (на 3 уровня выше: vpn-proxy.app/Contents/MacOS → vpn-proxy.app → mac/)
+HERE="$(cd "$(dirname "$0")" && pwd)"
+WORKDIR="$(cd "$HERE/../../.." && pwd)"
+
+if [ ! -f "$WORKDIR/gui.py" ]; then
+    osascript -e "display alert \"ZubriTunnel\" message \"Не нашёл gui.py рядом с .app. Положи ZubriTunnel.app в папку mac/ обратно.\""
+    exit 1
+fi
+
+cd "$WORKDIR"
+
+# проверка python3
+if ! command -v python3 >/dev/null 2>&1; then
+    osascript -e 'display alert "ZubriTunnel" message "python3 не найден. Установи Python 3 (brew install python3) и попробуй ещё раз."'
+    exit 1
+fi
+
+exec python3 gui.py

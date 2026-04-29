@@ -1,0 +1,8 @@
+{
+  "method": "chacha20-ietf-poly1305",
+  "password": "PASTE_PASSWORD_HERE",
+  "server": "1.2.3.4",
+  "server_port": 443,
+  "tag": "Country / Server name",
+  "prefix": ""
+}

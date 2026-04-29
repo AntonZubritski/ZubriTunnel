@@ -1,0 +1,39 @@
+# Personal VPN keys — NEVER commit these (they contain auth tokens)
+windows/keys/*.json
+mac/keys/*.json
+windows/config.json
+mac/config.json
+# Allow sample template
+!**/keys/example.json.template
+
+# Per-user GUI preferences (theme etc.)
+windows/settings.json
+mac/settings.json
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Build artefacts (re-generated locally; .exe is published as a release asset)
+windows/vpn-proxy.exe
+windows/rsrc_windows.syso
+windows/vpn-proxy.exe~
+
+# Mac binary (built locally from source)
+mac/vpn-proxy
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/
+*.swp
+
+# Temp
+icons-tmp/
+preview-*.png
+preview-on-*.png
+source_icon.png
+*.tmp

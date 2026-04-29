@@ -1,0 +1,122 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to publish (e.g. v1.0.0)'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache-dependency-path: windows/go.sum
+
+      - name: Install rsrc (icon embedder)
+        run: go install github.com/akavel/rsrc@latest
+
+      - name: Embed icon and build vpn-proxy.exe
+        working-directory: windows
+        run: |
+          $env:Path += ';' + (go env GOPATH) + '\bin'
+          rsrc -ico icon.ico -manifest "" -o rsrc_windows.syso
+          go build -o vpn-proxy.exe .
+
+      - name: Package Windows zip
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Compress-Archive -Path windows/*, README.md, VERSION `
+                           -DestinationPath dist/ZubriTunnel-windows.zip
+          Get-ChildItem dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: dist/ZubriTunnel-windows.zip
+
+  build-mac:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache-dependency-path: mac/go.sum
+
+      - name: Build mac/vpn-proxy binary
+        working-directory: mac
+        run: go build -o vpn-proxy .
+
+      - name: Make scripts executable
+        run: |
+          chmod +x mac/run.sh mac/gui.command
+          chmod +x "mac/ZubriTunnel.app/Contents/MacOS/launcher"
+
+      - name: Package Mac tar.gz (preserves +x bits)
+        run: |
+          mkdir -p dist
+          tar -czf dist/ZubriTunnel-mac.tar.gz \
+            mac README.md VERSION
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mac
+          path: dist/ZubriTunnel-mac.tar.gz
+
+  release:
+    needs: [build-windows, build-mac]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows
+          path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: mac
+          path: dist
+
+      - name: Resolve tag
+        id: tag
+        run: |
+          if [ -n "${{ github.event.inputs.tag }}" ]; then
+            echo "tag=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: ZubriTunnel ${{ steps.tag.outputs.tag }}
+          body: |
+            ZubriTunnel ${{ steps.tag.outputs.tag }} — точечный VPN для приложений.
+
+            **Скачать:**
+            - **Windows:** `ZubriTunnel-windows.zip` — распакуй, запусти `install_shortcut.ps1` через PowerShell, дальше двойной клик по ярлыку «ZubriTunnel» на рабочем столе.
+            - **macOS:** `ZubriTunnel-mac.tar.gz` — распакуй, в папке `mac/` двойной клик по `ZubriTunnel.app`.
+
+            Полная инструкция в README.
+          files: |
+            dist/ZubriTunnel-windows.zip
+            dist/ZubriTunnel-mac.tar.gz
+          generate_release_notes: true
