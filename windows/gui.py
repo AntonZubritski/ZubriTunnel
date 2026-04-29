@@ -57,9 +57,24 @@ def sanitize_json_bytes(data: bytes) -> bytes:
 
 
 def go_command() -> list:
-    exe = SCRIPT_DIR / ("vpn-proxy.exe" if IS_WIN else "vpn-proxy")
-    if exe.exists():
-        return [str(exe)]
+    """Return the command list to launch vpn-proxy. Order:
+       1. binary next to gui.py (./vpn-proxy or ./vpn-proxy.exe)
+       2. mac .app bundle: ../MacOS/vpn-proxy (CI-built universal binary)
+       3. `go run .` fallback if Go SDK is installed (dev mode)
+    """
+    if IS_WIN:
+        exe = SCRIPT_DIR / "vpn-proxy.exe"
+        if exe.exists():
+            return [str(exe)]
+    else:
+        # 1. Resources/vpn-proxy (sibling of gui.py)
+        exe = SCRIPT_DIR / "vpn-proxy"
+        if exe.exists():
+            return [str(exe)]
+        # 2. .app/Contents/MacOS/vpn-proxy (where CI puts the universal binary)
+        macos_exe = SCRIPT_DIR.parent / "MacOS" / "vpn-proxy"
+        if macos_exe.exists():
+            return [str(macos_exe)]
     return ["go", "run", "."]
 
 
