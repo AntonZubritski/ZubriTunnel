@@ -108,17 +108,42 @@ jobs:
           chmod +x mac/run.sh mac/gui.command
           chmod +x "mac/ZubriTunnel.app/Contents/MacOS/launcher"
 
+      - name: Ad-hoc codesign all binaries (helps Gatekeeper, no Apple ID needed)
+        run: |
+          APP="mac/ZubriTunnel.app"
+          # Sign nested binaries first (deep)
+          find "$APP/Contents/Frameworks" -type f \( -name "*.dylib" -o -perm +111 \) 2>/dev/null \
+            | while read f; do codesign --force --sign - "$f" 2>/dev/null || true; done
+          codesign --force --sign - "$APP/Contents/MacOS/vpn-proxy" 2>/dev/null || true
+          codesign --force --sign - "$APP/Contents/MacOS/launcher" 2>/dev/null || true
+          # Sign the app bundle as a whole
+          codesign --force --deep --sign - "$APP" 2>/dev/null || true
+          codesign --verify --deep "$APP" 2>&1 | head -5 || true
+
       - name: Package Mac tar.gz (preserves +x bits + Python runtimes)
         run: |
           mkdir -p dist
           tar -czf dist/ZubriTunnel-mac.tar.gz \
-            mac README.md VERSION
+            mac README.md VERSION install.sh
+          ls -lh dist/
+
+      - name: Build macOS .pkg installer (drag-drop alternative to tarball)
+        run: |
+          mkdir -p dist
+          # productbuild makes a flat .pkg that double-clicks → installer wizard → /Applications
+          pkgbuild --root mac/ZubriTunnel.app \
+                   --identifier local.zubritunnel \
+                   --version "${GITHUB_REF#refs/tags/v}" \
+                   --install-location "/Applications/ZubriTunnel.app" \
+                   dist/ZubriTunnel.pkg
           ls -lh dist/
 
       - uses: actions/upload-artifact@v4
         with:
           name: mac
-          path: dist/ZubriTunnel-mac.tar.gz
+          path: |
+            dist/ZubriTunnel-mac.tar.gz
+            dist/ZubriTunnel.pkg
 
   release:
     needs: [build-windows, build-mac]
@@ -152,12 +177,33 @@ jobs:
           body: |
             ZubriTunnel ${{ steps.tag.outputs.tag }} — точечный VPN для приложений.
 
-            **Скачать:**
-            - **Windows:** `ZubriTunnel-windows.zip` — распакуй, запусти `install_shortcut.ps1` через PowerShell, дальше двойной клик по ярлыку «ZubriTunnel» на рабочем столе.
-            - **macOS:** `ZubriTunnel-mac.tar.gz` — распакуй, в папке `mac/` двойной клик по `ZubriTunnel.app`.
+            ## 🍎 macOS — выбери удобный способ:
 
-            Полная инструкция в README.
+            **Самый простой — `.pkg` installer:**
+            1. Скачай `ZubriTunnel.pkg` ниже
+            2. Двойной клик → пройди стандартный installer wizard → готово
+            3. ZubriTunnel появится в `/Applications/`, открывай через Spotlight (`Cmd+Space → Zubritunnel`)
+
+            **Одна команда (для тех кто дружит с Terminal):**
+            ```bash
+            curl -fsSL https://raw.githubusercontent.com/AntonZubritski/ZubriTunnel/main/install.sh | bash
+            ```
+
+            **Ручной способ (`tar.gz`):** распакуй, в папке `mac/` запусти:
+            ```bash
+            xattr -dr com.apple.quarantine ZubriTunnel.app
+            open ZubriTunnel.app
+            ```
+
+            ## 🪟 Windows
+
+            Скачай `ZubriTunnel-windows.zip`, распакуй, запусти `install_shortcut.ps1` через PowerShell. Ярлык появится на рабочем столе.
+
+            ---
+
+            Полная инструкция: [README](https://github.com/AntonZubritski/ZubriTunnel/blob/main/README.md)
           files: |
             dist/ZubriTunnel-windows.zip
             dist/ZubriTunnel-mac.tar.gz
+            dist/ZubriTunnel.pkg
           generate_release_notes: true
