@@ -1,18 +1,16 @@
 #!/usr/bin/env bash
-# Лаунчер ZubriTunnel.app
-# Работает в двух режимах:
-#   1. Self-contained (release): файлы внутри Contents/Resources/
-#   2. Dev mode (git clone): файлы в родительской папке mac/
+# Лаунчер ZubriTunnel.app — диагностический режим: всё в лог, при ошибке alert.
 
-set -e
+LOG="$HOME/Library/Logs/ZubriTunnel.log"
+mkdir -p "$(dirname "$LOG")"
+
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
-# Try Resources/ first (release build with bundled source)
-RES="$(cd "$HERE/../Resources" 2>/dev/null && pwd || true)"
+# 1. Найти gui.py: сначала Resources/, потом sibling mac/
+RES="$(cd "$HERE/../Resources" 2>/dev/null && pwd)"
 if [ -n "$RES" ] && [ -f "$RES/gui.py" ]; then
     WORKDIR="$RES"
 elif [ -f "$HERE/../../../gui.py" ]; then
-    # Dev mode: .app sits inside the mac/ folder next to gui.py
     WORKDIR="$(cd "$HERE/../../.." && pwd)"
 else
     osascript -e 'display alert "ZubriTunnel" message "Не нашёл gui.py.\n\nЕсли ты перетащил .app, верни его в исходную папку или скачай свежий релиз: github.com/AntonZubritski/ZubriTunnel/releases"'
@@ -21,9 +19,34 @@ fi
 
 cd "$WORKDIR"
 
-if ! command -v python3 >/dev/null 2>&1; then
-    osascript -e 'display alert "ZubriTunnel" message "python3 не найден.\n\nУстанови: brew install python3"'
+# 2. Найти python3
+PY="$(command -v python3 2>/dev/null)"
+if [ -z "$PY" ]; then
+    # пробуем стандартные места
+    for p in /opt/homebrew/bin/python3 /usr/local/bin/python3 /usr/bin/python3; do
+        if [ -x "$p" ]; then PY="$p"; break; fi
+    done
+fi
+if [ -z "$PY" ]; then
+    osascript -e 'display alert "ZubriTunnel" message "python3 не найден.\n\nУстанови Python 3:\nbrew install python3\n\nили скачай с python.org/downloads/macos"'
     exit 1
 fi
 
-exec python3 gui.py
+# 3. Запуск с захватом stdout+stderr в лог
+{
+    echo ""
+    echo "=== $(date) ==="
+    echo "workdir: $WORKDIR"
+    echo "python:  $PY ($($PY --version 2>&1))"
+    echo ""
+    "$PY" gui.py
+} >> "$LOG" 2>&1
+
+EXIT_CODE=$?
+
+# 4. Если упало — показать alert с последними строками лога
+if [ "$EXIT_CODE" -ne 0 ]; then
+    LAST="$(tail -25 "$LOG" | sed 's/"/\\"/g; s/$/\\n/g' | tr -d '\n' | head -c 1500)"
+    osascript -e "display alert \"ZubriTunnel: ошибка запуска (код $EXIT_CODE)\" message \"Полный лог: ~/Library/Logs/ZubriTunnel.log\n\n$LAST\""
+    exit "$EXIT_CODE"
+fi

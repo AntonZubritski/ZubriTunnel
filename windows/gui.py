@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """vpn-proxy GUI — управление ключами Outline и точечный запуск программ через прокси."""
+from __future__ import annotations  # allow `dict[str, dict]` / `T | None` on Python 3.7-3.9
 import json
 import os
 import platform
