@@ -48,63 +48,39 @@ jobs:
           name: windows
           path: dist/ZubriTunnel-windows.zip
 
-  # Build vpn-proxy NATIVELY on each macOS arch — avoids fragile cross-compilation
-  # of outline-sdk + x/mobile. Each runner produces a single-arch binary;
-  # the merge job below combines them with `lipo` and bundles Python runtimes.
-  build-mac-bin:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: arm64
-            runner: macos-14    # Apple Silicon
-            go-arch: arm64
-          - arch: x86_64
-            runner: macos-13    # Intel
-            go-arch: amd64
-    runs-on: ${{ matrix.runner }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version: '1.22'
-          cache-dependency-path: mac/ZubriTunnel.app/Contents/Resources/go.sum
-      - name: Build vpn-proxy (${{ matrix.arch }})
-        working-directory: mac/ZubriTunnel.app/Contents/Resources
-        run: go build -o /tmp/vpn-proxy-${{ matrix.arch }} .
-      - name: Inspect binary
-        run: file /tmp/vpn-proxy-${{ matrix.arch }}
-      - uses: actions/upload-artifact@v4
-        with:
-          name: vpn-proxy-${{ matrix.arch }}
-          path: /tmp/vpn-proxy-${{ matrix.arch }}
-
   build-mac:
-    needs: build-mac-bin
-    runs-on: macos-14
+    runs-on: macos-14    # Apple Silicon — its Xcode SDK is universal,
+                         # so we can cross-compile to x86_64 with proper -arch flags
     env:
       PY_VERSION: "3.12.7"
       PY_BUILD: "20241016"
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/setup-go@v5
         with:
-          name: vpn-proxy-arm64
-          path: /tmp/bin-arm64
-      - uses: actions/download-artifact@v4
-        with:
-          name: vpn-proxy-x86_64
-          path: /tmp/bin-x86_64
+          go-version: '1.22'
+          cache-dependency-path: mac/ZubriTunnel.app/Contents/Resources/go.sum
 
-      - name: Combine into universal vpn-proxy
+      - name: Build universal vpn-proxy (arm64 native + x86_64 cross with CGO)
         run: |
+          RES="mac/ZubriTunnel.app/Contents/Resources"
           MACOS="mac/ZubriTunnel.app/Contents/MacOS"
-          chmod +x /tmp/bin-arm64/vpn-proxy-arm64 /tmp/bin-x86_64/vpn-proxy-x86_64
-          lipo -create \
-            /tmp/bin-arm64/vpn-proxy-arm64 \
-            /tmp/bin-x86_64/vpn-proxy-x86_64 \
-            -output "$MACOS/vpn-proxy"
+
+          # arm64 native — straightforward
+          (cd "$RES" && go build -o /tmp/vpn-proxy-arm64 .)
+          file /tmp/vpn-proxy-arm64
+
+          # x86_64 cross — clang on Apple Silicon supports -arch x86_64 via the
+          # universal SDK (CommandLineTools include both x86_64 and arm64 stubs).
+          (cd "$RES" && \
+            CGO_ENABLED=1 GOARCH=amd64 GOOS=darwin \
+            CC="clang -arch x86_64" CXX="clang++ -arch x86_64" \
+            go build -o /tmp/vpn-proxy-x86_64 .)
+          file /tmp/vpn-proxy-x86_64
+
+          # Merge into universal binary
+          lipo -create /tmp/vpn-proxy-arm64 /tmp/vpn-proxy-x86_64 -output "$MACOS/vpn-proxy"
           chmod +x "$MACOS/vpn-proxy"
           file "$MACOS/vpn-proxy"
 
