@@ -82,12 +82,13 @@ jobs:
           go-version: '1.22'
           cache-dependency-path: mac/ZubriTunnel.app/Contents/Resources/go.sum
 
-      - name: Build vpn-proxy as universal binary
+      - name: Build vpn-proxy as universal binary (no CGO)
         run: |
           RES="mac/ZubriTunnel.app/Contents/Resources"
           MACOS="mac/ZubriTunnel.app/Contents/MacOS"
-          (cd "$RES" && GOARCH=arm64 go build -o "../MacOS/vpn-proxy-arm64" .)
-          (cd "$RES" && GOARCH=amd64 go build -o "../MacOS/vpn-proxy-x86_64" .)
+          export CGO_ENABLED=0
+          (cd "$RES" && GOARCH=arm64 GOOS=darwin go build -o "../MacOS/vpn-proxy-arm64" .)
+          (cd "$RES" && GOARCH=amd64 GOOS=darwin go build -o "../MacOS/vpn-proxy-x86_64" .)
           lipo -create "$MACOS/vpn-proxy-arm64" "$MACOS/vpn-proxy-x86_64" -output "$MACOS/vpn-proxy"
           rm "$MACOS/vpn-proxy-arm64" "$MACOS/vpn-proxy-x86_64"
           file "$MACOS/vpn-proxy"
