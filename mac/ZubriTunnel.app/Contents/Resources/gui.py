@@ -56,6 +56,60 @@ def sanitize_json_bytes(data: bytes) -> bytes:
     return bytes(out)
 
 
+def check_dependencies() -> list:
+    """Список ключевых зависимостей с их статусом.
+    Возвращает: [{name, ok, detail, fix_label, fix_action}]"""
+    deps = []
+
+    # Python (мы уже работаем, значит OK)
+    deps.append({
+        "name": "Python 3 + Tkinter",
+        "ok": True,
+        "detail": f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro} ({sys.executable})",
+        "fix_label": None,
+        "fix_action": None,
+    })
+
+    # vpn-proxy binary
+    cmd = go_command()
+    binary_path = cmd[0] if cmd[0] != "go" else None
+    deps.append({
+        "name": "vpn-proxy",
+        "ok": binary_path is not None,
+        "detail": binary_path or "не найден — будет fallback на 'go run'",
+        "fix_label": "Собрать" if not binary_path else None,
+        "fix_action": "build_vpn_proxy" if not binary_path else None,
+    })
+
+    # Go SDK (нужен для пересборки)
+    go_path = shutil.which("go")
+    deps.append({
+        "name": "Go SDK",
+        "ok": go_path is not None,
+        "detail": go_path or "не установлен (нужен только если хочешь пересобрать vpn-proxy)",
+        "fix_label": "Установить" if not go_path else None,
+        "fix_action": "install_go" if not go_path else None,
+    })
+
+    # Homebrew (Mac only)
+    if IS_MAC:
+        brew = shutil.which("brew")
+        if not brew:
+            for p in ("/opt/homebrew/bin/brew", "/usr/local/bin/brew"):
+                if os.path.exists(p):
+                    brew = p
+                    break
+        deps.append({
+            "name": "Homebrew",
+            "ok": brew is not None,
+            "detail": brew or "не установлен (нужен для установки Go и других пакетов)",
+            "fix_label": "Установить" if not brew else None,
+            "fix_action": "install_brew" if not brew else None,
+        })
+
+    return deps
+
+
 def go_command() -> list:
     """Return the command list to launch vpn-proxy. Order:
        1. binary next to gui.py (./vpn-proxy or ./vpn-proxy.exe)
@@ -875,6 +929,9 @@ class App(tk.Tk):
         for code, label in [("system", "системная"), ("dark", "тёмная"), ("light", "светлая")]:
             ttk.Radiobutton(theme_box, text=label, value=code, variable=self.theme_var,
                             command=self._on_theme_change).pack(side="left", padx=4)
+        # Кнопка проверки зависимостей
+        RoundButton(head, text="⚙ проверка системы", variant="tool",
+                    command=self.show_deps_dialog).pack(side="right", padx=(0, 14))
 
         # Status card
         bar = RoundedCard(outer, radius=18, fill=COLORS["panel"])
@@ -1758,6 +1815,141 @@ class App(tk.Tk):
                 w.configure(state="disabled")
             except Exception:
                 pass
+
+    def show_deps_dialog(self):
+        """Окно «Проверка системы» — список зависимостей со статусом и кнопками установки."""
+        win = tk.Toplevel(self)
+        win.title("Системные зависимости")
+        win.geometry("680x500")
+        win.transient(self)
+        win.configure(bg=COLORS["bg"])
+        win.after(50, lambda: apply_dark_titlebar(win, self.actual_theme == "dark"))
+
+        outer = tk.Frame(win, bg=COLORS["bg"])
+        outer.pack(fill="both", expand=True, padx=14, pady=14)
+
+        tk.Label(outer, text="Системные зависимости", bg=COLORS["bg"],
+                 fg=COLORS["text"], font=UI_FONT_TITLE).pack(anchor="w", pady=(0, 4))
+        tk.Label(outer, text="Зелёная галочка — установлено. Красный крестик — нажми «Установить».",
+                 bg=COLORS["bg"], fg=COLORS["muted"], font=UI_FONT,
+                 wraplength=620, justify="left").pack(anchor="w", pady=(0, 12))
+
+        list_card = RoundedCard(outer, radius=14, fill=COLORS["panel"])
+        list_card.pack(fill="both", expand=True)
+        list_card.body.configure(bg=COLORS["panel"])
+        rows_frame = tk.Frame(list_card.body, bg=COLORS["panel"])
+        rows_frame.pack(fill="both", expand=True, padx=18, pady=14)
+
+        for dep in check_dependencies():
+            row = tk.Frame(rows_frame, bg=COLORS["panel"])
+            row.pack(fill="x", pady=6)
+
+            mark = "✓" if dep["ok"] else "✗"
+            mark_color = COLORS["ok"] if dep["ok"] else COLORS["err"]
+            tk.Label(row, text=mark, bg=COLORS["panel"], fg=mark_color,
+                     font=(UI_FONT[0], 18, "bold"), width=2).pack(side="left", padx=(0, 8))
+
+            text_box = tk.Frame(row, bg=COLORS["panel"])
+            text_box.pack(side="left", fill="x", expand=True)
+            tk.Label(text_box, text=dep["name"], bg=COLORS["panel"], fg=COLORS["text"],
+                     font=UI_FONT_BOLD).pack(anchor="w")
+            tk.Label(text_box, text=dep["detail"], bg=COLORS["panel"], fg=COLORS["muted"],
+                     font=UI_FONT, wraplength=440, justify="left").pack(anchor="w")
+
+            if dep["fix_label"] and dep["fix_action"]:
+                action = dep["fix_action"]
+                RoundButton(row, text=dep["fix_label"], variant="accent",
+                            command=lambda a=action, w=win: self._run_dep_fix(a, w)).pack(side="right")
+
+        bottom = tk.Frame(outer, bg=COLORS["bg"])
+        bottom.pack(fill="x", pady=(12, 0))
+        RoundButton(bottom, text="Обновить", variant="tool",
+                    command=lambda: (win.destroy(), self.show_deps_dialog())).pack(side="left")
+        RoundButton(bottom, text="Закрыть", variant="tool", command=win.destroy).pack(side="right")
+
+    def _run_dep_fix(self, action: str, parent_win=None):
+        """Выполнить действие установки зависимости."""
+        if action == "build_vpn_proxy":
+            self._build_vpn_proxy_dialog()
+        elif action == "install_go":
+            self._install_go()
+        elif action == "install_brew":
+            self._install_brew()
+        if parent_win is not None:
+            try:
+                parent_win.destroy()
+            except Exception:
+                pass
+
+    def _build_vpn_proxy_dialog(self):
+        """Запускает 'go build' в фоне и пишет в лог."""
+        if not shutil.which("go"):
+            messagebox.showerror("Go не установлен",
+                "Сначала установи Go SDK через «проверку системы» — кнопка «Установить» рядом с Go.")
+            return
+        # Подбираем рабочую директорию: Resources/ для Mac .app, или mac/ для dev mode
+        candidates = [SCRIPT_DIR, SCRIPT_DIR.parent / "Resources", SCRIPT_DIR.parent.parent / "Resources"]
+        workdir = None
+        for c in candidates:
+            if (c / "main.go").exists():
+                workdir = c
+                break
+        if not workdir:
+            messagebox.showerror("Не нашёл main.go", "main.go должен лежать рядом с gui.py")
+            return
+        out = SCRIPT_DIR.parent / "MacOS" / "vpn-proxy" if IS_MAC else SCRIPT_DIR / "vpn-proxy.exe"
+        out.parent.mkdir(exist_ok=True)
+        self.log_msg(f"Сборка vpn-proxy из {workdir}…")
+        threading.Thread(target=self._build_thread, args=(str(workdir), str(out)), daemon=True).start()
+
+    def _build_thread(self, workdir: str, out: str):
+        try:
+            r = subprocess.run(["go", "build", "-o", out, "."],
+                               cwd=workdir, capture_output=True, text=True, timeout=180)
+            if r.returncode == 0:
+                self.log_msg(f"vpn-proxy собран: {out}")
+                self.after(0, lambda: messagebox.showinfo("Готово", f"vpn-proxy собран: {out}"))
+            else:
+                self.log_msg(f"go build failed: {r.stderr.strip()[:500]}")
+                self.after(0, lambda: messagebox.showerror("Сборка упала", r.stderr or r.stdout or "(пустой вывод)"))
+        except Exception as e:
+            self.after(0, lambda: messagebox.showerror("Ошибка", str(e)))
+
+    def _install_go(self):
+        if IS_MAC:
+            brew = shutil.which("brew") or "/opt/homebrew/bin/brew"
+            if os.path.exists(brew):
+                self._open_terminal_install(f"arch -arm64 {brew} install go" if "/opt/homebrew" in brew else f"{brew} install go")
+            else:
+                messagebox.showinfo("Сначала Homebrew",
+                    "Сначала установи Homebrew (есть кнопка в «проверке системы»), потом обнови проверку и нажми «Установить» рядом с Go.")
+        elif IS_WIN:
+            import webbrowser
+            webbrowser.open("https://go.dev/dl/")
+            messagebox.showinfo("Скачай Go",
+                "Открыл https://go.dev/dl/ — скачай инсталлер и запусти. После установки перезапусти ZubriTunnel.")
+        else:
+            self._open_terminal_install("sudo apt-get install -y golang || sudo dnf install -y golang")
+
+    def _install_brew(self):
+        if not IS_MAC:
+            messagebox.showinfo("Только Mac", "Homebrew нужен только на macOS.")
+            return
+        cmd = '/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"'
+        self._open_terminal_install(cmd)
+
+    def _open_terminal_install(self, command: str):
+        """Открыть Terminal/cmd с командой установки."""
+        if IS_MAC:
+            # Экранируем кавычки для AppleScript
+            esc = command.replace('\\', '\\\\').replace('"', '\\"')
+            script = f'tell application "Terminal" to do script "{esc}"\ntell application "Terminal" to activate'
+            subprocess.Popen(["osascript", "-e", script])
+        elif IS_WIN:
+            subprocess.Popen(["cmd.exe", "/k", command])
+        else:
+            subprocess.Popen(["x-terminal-emulator", "-e", command])
+        self.log_msg(f"открыл терминал: {command}")
 
     def open_log_window(self):
         if self._log_window is not None and self._log_window.winfo_exists():
