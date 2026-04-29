@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Лаунчер ZubriTunnel.app
-# Все source-файлы внутри bundle (.app/Contents/Resources/) — TCC sandbox их не блокирует.
+# Source-файлы внутри bundle (.app/Contents/Resources/) — TCC их не блокирует.
 
 LOG="$HOME/Library/Logs/ZubriTunnel.log"
 mkdir -p "$(dirname "$LOG")"
@@ -15,15 +15,40 @@ fi
 
 cd "$RES"
 
-# Найти python3
-PY="$(command -v python3 2>/dev/null)"
-if [ -z "$PY" ]; then
-    for p in /opt/homebrew/bin/python3 /usr/local/bin/python3 /usr/bin/python3; do
-        if [ -x "$p" ]; then PY="$p"; break; fi
+# Найти РАБОЧИЙ python3. Apple-овский /usr/bin/python3 на старых macOS ломается
+# с "macOS 15 required" — поэтому пробуем альтернативы и проверяем что каждый
+# реально запускается (даёт версию, не падает с dyld error).
+find_working_python() {
+    local candidates=(
+        /opt/homebrew/bin/python3        # Apple Silicon Homebrew
+        /opt/homebrew/bin/python3.12
+        /opt/homebrew/bin/python3.11
+        /opt/homebrew/bin/python3.10
+        /usr/local/bin/python3            # Intel Homebrew
+        /usr/local/bin/python3.12
+        /usr/local/bin/python3.11
+        /usr/local/bin/python3.10
+        /Library/Frameworks/Python.framework/Versions/3.12/bin/python3
+        /Library/Frameworks/Python.framework/Versions/3.11/bin/python3
+        /Library/Frameworks/Python.framework/Versions/3.10/bin/python3
+        "$(command -v python3 2>/dev/null)"
+        /usr/bin/python3                  # Apple stub (often broken)
+    )
+    for p in "${candidates[@]}"; do
+        [ -z "$p" ] && continue
+        [ -x "$p" ] || continue
+        # Проверяем что Python запускается без dyld-ошибок
+        if "$p" -c "import tkinter" >/dev/null 2>&1; then
+            echo "$p"
+            return 0
+        fi
     done
-fi
+    return 1
+}
+
+PY="$(find_working_python)"
 if [ -z "$PY" ]; then
-    osascript -e 'display alert "ZubriTunnel" message "python3 не найден.\n\nУстанови: brew install python3\nили скачай: python.org/downloads/macos"'
+    osascript -e 'display alert "ZubriTunnel — нет рабочего Python" message "Установи Python 3 одним из способов:\n\n• Homebrew (рекомендую):\n   brew install python3 python-tk\n\n• Скачать с python.org:\n   https://www.python.org/downloads/macos\n\nApple-овский python3 в /usr/bin/ часто требует macOS 15+. Установка отдельного Python через Homebrew решает проблему."'
     exit 1
 fi
 
