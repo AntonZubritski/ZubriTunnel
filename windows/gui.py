@@ -343,6 +343,81 @@ def find_free_port(host: str = "127.0.0.1", preferred: int = 8080, avoid: set | 
         return s.getsockname()[1]
 
 
+def system_proxy_set(host_port: str | None):
+    """Включить/выключить системный HTTP+HTTPS прокси.
+       host_port: 'host:port' для включения, None для выключения.
+       Возвращает (ok: bool, msg: str)."""
+    if os.name == "nt":
+        return _system_proxy_windows(host_port)
+    if sys.platform == "darwin":
+        return _system_proxy_macos(host_port)
+    return _system_proxy_linux(host_port)
+
+
+def _system_proxy_windows(host_port):
+    try:
+        import winreg
+        import ctypes
+        KEY = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings"
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, KEY, 0, winreg.KEY_WRITE) as k:
+            if host_port:
+                winreg.SetValueEx(k, "ProxyEnable", 0, winreg.REG_DWORD, 1)
+                winreg.SetValueEx(k, "ProxyServer", 0, winreg.REG_SZ, host_port)
+                winreg.SetValueEx(k, "ProxyOverride", 0, winreg.REG_SZ, "<local>")
+            else:
+                winreg.SetValueEx(k, "ProxyEnable", 0, winreg.REG_DWORD, 0)
+        # Notify Windows that proxy settings changed
+        try:
+            wininet = ctypes.windll.Wininet
+            wininet.InternetSetOptionW(0, 39, 0, 0)  # SETTINGS_CHANGED
+            wininet.InternetSetOptionW(0, 37, 0, 0)  # REFRESH
+        except Exception:
+            pass
+        return True, ""
+    except Exception as e:
+        return False, str(e)
+
+
+def _system_proxy_macos(host_port):
+    try:
+        # Получить список активных сетевых сервисов (Wi-Fi, Ethernet, ...)
+        r = subprocess.run(
+            ["networksetup", "-listallnetworkservices"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if r.returncode != 0:
+            return False, r.stderr or r.stdout
+        services = []
+        for line in r.stdout.splitlines():
+            s = line.strip()
+            if not s or s.startswith("*") or s.startswith("An asterisk"):
+                continue
+            services.append(s)
+
+        for svc in services:
+            if host_port:
+                host, _, port = host_port.partition(":")
+                subprocess.run(["networksetup", "-setwebproxy", svc, host, port],
+                               capture_output=True, timeout=5)
+                subprocess.run(["networksetup", "-setsecurewebproxy", svc, host, port],
+                               capture_output=True, timeout=5)
+                subprocess.run(["networksetup", "-setproxybypassdomains", svc,
+                                "localhost", "127.0.0.1", "*.local"],
+                               capture_output=True, timeout=5)
+            else:
+                subprocess.run(["networksetup", "-setwebproxystate", svc, "off"],
+                               capture_output=True, timeout=5)
+                subprocess.run(["networksetup", "-setsecurewebproxystate", svc, "off"],
+                               capture_output=True, timeout=5)
+        return True, ""
+    except Exception as e:
+        return False, str(e)
+
+
+def _system_proxy_linux(host_port):
+    return False, "Системный прокси на Linux не реализован — поставь руками через GNOME/KDE settings"
+
+
 def proxy_env(proxy_url: str) -> dict:
     e = os.environ.copy()
     e.update({
@@ -1152,6 +1227,10 @@ class App(tk.Tk):
                              command=lambda: self.toggle_ide_terminals(True)))
         flow.add(RoundButton(flow, text="IDE terminals off", variant="tool",
                              command=lambda: self.toggle_ide_terminals(False)))
+        flow.add(RoundButton(flow, text="системный VPN on", variant="accent",
+                             command=lambda: self.toggle_system_proxy(True)))
+        flow.add(RoundButton(flow, text="системный VPN off", variant="tool",
+                             command=lambda: self.toggle_system_proxy(False)))
 
     # ---- key management ----
 
@@ -1989,6 +2068,43 @@ class App(tk.Tk):
         if f:
             self.launch_app(Path(f).name, [f])
 
+    def toggle_system_proxy(self, on: bool):
+        """Включить/выключить системный HTTP/HTTPS proxy через настройки ОС."""
+        if on:
+            active = self._selected_or_first_proxy()
+            if not active:
+                messagebox.showwarning("Подключи прокси",
+                    "Сначала подключи ключ — системному прокси нужен порт активного подключения.")
+                return
+            host_port = active["addr"]
+            ok, msg = system_proxy_set(host_port)
+            if ok:
+                self._system_proxy_active = host_port
+                self.log_msg(f"системный прокси: вкл ({host_port})")
+                messagebox.showinfo(
+                    "Системный VPN включён",
+                    f"Весь HTTP/HTTPS-трафик системы теперь идёт через {host_port}.\n\n"
+                    "Что работает через VPN:\n"
+                    "  • Все браузеры (Chrome, Safari, Firefox, Edge…)\n"
+                    "  • Большинство приложений и мессенджеров\n"
+                    "  • git, npm, pip и прочие CLI\n\n"
+                    "Что НЕ через VPN:\n"
+                    "  • UDP-трафик (DNS, видеозвонки, игры)\n"
+                    "  • Apps игнорирующие системные настройки\n\n"
+                    "⚠ Не забудь выключить перед закрытием ZubriTunnel — иначе интернет ляжет!\n"
+                    "(если такое случилось — открой ZubriTunnel снова и нажми «системный VPN off»)"
+                )
+            else:
+                messagebox.showerror("Ошибка", f"Не удалось включить:\n{msg}")
+        else:
+            ok, msg = system_proxy_set(None)
+            if ok:
+                self._system_proxy_active = None
+                self.log_msg("системный прокси: выкл")
+                messagebox.showinfo("Готово", "Системный VPN выключен. Все приложения теперь идут напрямую.")
+            else:
+                messagebox.showerror("Ошибка", f"Не удалось выключить:\n{msg}")
+
     def _selected_or_first_proxy(self):
         """Вернуть выбранный ключ если он подключён, иначе любой подключённый."""
         sel = self.selected_key()
@@ -2605,9 +2721,16 @@ def main():
         app.tk.call("tk", "appname", "ZubriTunnel")
     except Exception:
         pass
-    # Register atexit so even hard crashes / Ctrl-C kill child vpn-proxy on Windows
+    # Register atexit so even hard crashes / Ctrl-C cleanup
     import atexit
-    def _kill_all_subprocs():
+    def _cleanup_on_exit():
+        # Disable system proxy if user left it on — иначе интернет в системе ляжет
+        if getattr(app, "_system_proxy_active", None):
+            try:
+                system_proxy_set(None)
+            except Exception:
+                pass
+        # Kill any remaining vpn-proxy subprocesses
         for name in list(app.proxies.keys()):
             try:
                 p = app.proxies.get(name)
@@ -2615,7 +2738,7 @@ def main():
                     p["proc"].kill()
             except Exception:
                 pass
-    atexit.register(_kill_all_subprocs)
+    atexit.register(_cleanup_on_exit)
     def on_close():
         for name in list(app.proxies.keys()):
             try:
