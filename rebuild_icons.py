@@ -12,7 +12,10 @@ Source layout (from realfavicongenerator.net or similar):
 import io
 import struct
 from pathlib import Path
-from PIL import Image
+from PIL import Image, ImageChops, ImageDraw
+
+# macOS squircle radius — Apple's standard icon corner radius is ~22.4% of side.
+ROUND_RADIUS_PCT = 0.224
 
 ROOT = Path(__file__).resolve().parent
 SRC = Path(r"C:\Users\a.zubr\Downloads\favicon")
@@ -44,6 +47,24 @@ def png_resize(src_png: Path, target: int) -> bytes:
     img = Image.open(src_png).convert("RGBA")
     if img.size != (target, target):
         img = img.resize((target, target), Image.LANCZOS)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG", optimize=True)
+    return buf.getvalue()
+
+
+def round_png(png_bytes: bytes, radius_pct: float = ROUND_RADIUS_PCT) -> bytes:
+    """Apply macOS squircle alpha mask to a PNG. Outside the rounded
+    rectangle becomes transparent — gives the native Mac icon look."""
+    img = Image.open(io.BytesIO(png_bytes)).convert("RGBA")
+    w, h = img.size
+    radius = max(1, int(min(w, h) * radius_pct))
+    mask = Image.new("L", (w, h), 0)
+    ImageDraw.Draw(mask).rounded_rectangle(
+        (0, 0, w - 1, h - 1), radius=radius, fill=255
+    )
+    r, g, b, a = img.split()
+    a = ImageChops.multiply(a, mask)
+    img = Image.merge("RGBA", (r, g, b, a))
     buf = io.BytesIO()
     img.save(buf, format="PNG", optimize=True)
     return buf.getvalue()
@@ -116,18 +137,29 @@ def main():
 
     print(f"  prepared sizes: {sorted(pngs.keys())}")
 
-    # Save 256-px PNG into both folders for the GUI's iconphoto fallback
-    for d in (ROOT / "windows", ROOT / "mac"):
-        d.mkdir(exist_ok=True)
-        (d / "icon.png").write_bytes(pngs[256])
-
-    # Windows .ico — include sizes 16-256 (Windows uses these for various contexts)
+    # Windows: square icon (Windows clips its own corners in shell/taskbar)
+    (ROOT / "windows").mkdir(exist_ok=True)
+    (ROOT / "windows" / "icon.png").write_bytes(pngs[256])
     ico_sizes = {s: pngs[s] for s in (16, 32, 48, 64, 96, 128, 256) if s in pngs}
     (ROOT / "windows" / "icon.ico").write_bytes(make_ico(ico_sizes))
 
-    # Mac .icns — uses specific sizes
-    icns_sizes = {s: pngs[s] for s in (16, 32, 64, 128, 256, 512, 1024) if s in pngs}
-    (ROOT / "mac" / "icon.icns").write_bytes(make_icns(icns_sizes))
+    # Mac: build SEPARATELY from real PNG sources (favicon.ico embeds BMPs that
+    # we can't reliably round), then apply squircle mask to all sizes.
+    print("\nbuilding Mac icons with squircle (rounded) corners…")
+    mac_pngs = {
+        16:   png_resize(src_96, 16),
+        32:   png_resize(src_96, 32),
+        64:   png_resize(src_96, 64),
+        128:  png_resize(src_192, 128),
+        256:  png_resize(src_512, 256),
+        512:  src_512.read_bytes(),
+        1024: png_resize(src_512, 1024),
+    }
+    mac_pngs_round = {s: round_png(b) for s, b in mac_pngs.items()}
+
+    (ROOT / "mac").mkdir(exist_ok=True)
+    (ROOT / "mac" / "icon.png").write_bytes(mac_pngs_round[256])
+    (ROOT / "mac" / "icon.icns").write_bytes(make_icns(mac_pngs_round))
 
     print("\nWritten:")
     for f in (ROOT / "windows" / "icon.ico", ROOT / "windows" / "icon.png",

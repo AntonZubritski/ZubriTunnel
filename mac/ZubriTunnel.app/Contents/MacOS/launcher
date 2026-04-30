@@ -100,7 +100,9 @@ fi
     echo "workdir: $RES"
     echo "python:  $PY ($($PY --version 2>&1))"
     echo ""
-    "$PY" gui.py
+    # exec -a "ZubriTunnel" rewrites argv[0] so 'ps', Activity Monitor and
+    # macOS process name show 'ZubriTunnel' instead of 'python3'.
+    exec -a "ZubriTunnel" "$PY" gui.py
 } >> "$LOG" 2>&1
 
 EXIT_CODE=$?

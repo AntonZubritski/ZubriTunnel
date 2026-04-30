@@ -2444,11 +2444,67 @@ def setup_windows_taskbar_id():
         pass
 
 
+def setup_macos_app_name(name: str = "ZubriTunnel"):
+    """Override macOS process / menu-bar / dock display name from 'Python' to
+    our app name. Uses libobjc (no PyObjC dep needed). Best-effort — silently
+    skips if any objc call fails (e.g. on non-Apple Python builds)."""
+    if sys.platform != "darwin":
+        return
+    try:
+        import ctypes
+        import ctypes.util
+
+        objc = ctypes.cdll.LoadLibrary(ctypes.util.find_library("objc"))
+        # Foundation framework gives us NSBundle / NSString
+        ctypes.cdll.LoadLibrary("/System/Library/Frameworks/Foundation.framework/Foundation")
+
+        objc.objc_getClass.restype = ctypes.c_void_p
+        objc.objc_getClass.argtypes = [ctypes.c_char_p]
+        objc.sel_registerName.restype = ctypes.c_void_p
+        objc.sel_registerName.argtypes = [ctypes.c_char_p]
+
+        # objc_msgSend has no fixed signature — we wrap it via cast for each call shape
+        msgSend_addr = ctypes.addressof(objc.objc_msgSend)
+        proto_obj_no_args = ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p)
+        proto_obj_str = ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_char_p)
+        proto_obj_2obj = ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p)
+        msg = proto_obj_no_args(msgSend_addr)
+        msg_str = proto_obj_str(msgSend_addr)
+        msg_2obj = proto_obj_2obj(msgSend_addr)
+
+        NSBundle = objc.objc_getClass(b"NSBundle")
+        bundle = msg(NSBundle, objc.sel_registerName(b"mainBundle"))
+        if not bundle:
+            return
+        info = msg(bundle, objc.sel_registerName(b"localizedInfoDictionary"))
+        if not info:
+            info = msg(bundle, objc.sel_registerName(b"infoDictionary"))
+        if not info:
+            return
+
+        NSString = objc.objc_getClass(b"NSString")
+        sel_string = objc.sel_registerName(b"stringWithUTF8String:")
+        ns_name = msg_str(NSString, sel_string, name.encode("utf-8"))
+        ns_key = msg_str(NSString, sel_string, b"CFBundleName")
+        if not ns_name or not ns_key:
+            return
+
+        msg_2obj(info, objc.sel_registerName(b"setValue:forKey:"), ns_name, ns_key)
+    except Exception:
+        pass
+
+
 def main():
     setup_windows_dpi()
     setup_windows_taskbar_id()
+    setup_macos_app_name("ZubriTunnel")
     KEYS_DIR.mkdir(exist_ok=True)
     app = App()
+    # Tell Tk our app name (helps on some systems for window title / X11)
+    try:
+        app.tk.call("tk", "appname", "ZubriTunnel")
+    except Exception:
+        pass
     def on_close():
         for name in list(app.proxies.keys()):
             try:
