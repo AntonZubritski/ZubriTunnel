@@ -1099,6 +1099,10 @@ class App(tk.Tk):
                     command=lambda: self.toggle_git_proxy(True)).pack(side="left", padx=(14, 6), pady=2)
         RoundButton(self.launch_frame, text="git proxy off", variant="tool",
                     command=lambda: self.toggle_git_proxy(False)).pack(side="left", padx=(0, 6), pady=2)
+        RoundButton(self.launch_frame, text="IDE terminals on", variant="tool",
+                    command=lambda: self.toggle_ide_terminals(True)).pack(side="left", padx=(14, 6), pady=2)
+        RoundButton(self.launch_frame, text="IDE terminals off", variant="tool",
+                    command=lambda: self.toggle_ide_terminals(False)).pack(side="left", padx=(0, 6), pady=2)
 
     # ---- key management ----
 
@@ -1891,21 +1895,186 @@ class App(tk.Tk):
         if f:
             self.launch_app(Path(f).name, [f])
 
+    def _selected_or_first_proxy(self):
+        """Вернуть выбранный ключ если он подключён, иначе любой подключённый."""
+        sel = self.selected_key()
+        if sel:
+            p = self.proxies.get(sel["name"])
+            if p and p["proc"].poll() is None:
+                return p
+        for v in self.proxies.values():
+            if v["proc"].poll() is None:
+                return v
+        return None
+
     def toggle_git_proxy(self, on: bool):
         try:
             if on:
-                proxy = f"http://{self.proxy_addr}"
-                subprocess.run(["git", "config", "--global", "http.proxy", proxy], check=True)
-                subprocess.run(["git", "config", "--global", "https.proxy", proxy], check=True)
+                active = self._selected_or_first_proxy()
+                if not active:
+                    messagebox.showwarning("Подключи прокси",
+                        "Сначала подключи ключ — git нужен порт активного прокси.")
+                    return
+                proxy = f"http://{active['addr']}"
+                subprocess.run(["git", "config", "--global", "http.proxy", proxy],
+                               env=enhanced_path_env(), check=True)
+                subprocess.run(["git", "config", "--global", "https.proxy", proxy],
+                               env=enhanced_path_env(), check=True)
                 self.log_msg(f"git: http.proxy={proxy} (global)")
                 messagebox.showinfo("git", f"Все git-команды теперь через {proxy}.\nНе забудь выключить, когда наскучит.")
             else:
-                subprocess.run(["git", "config", "--global", "--unset", "http.proxy"])
-                subprocess.run(["git", "config", "--global", "--unset", "https.proxy"])
+                subprocess.run(["git", "config", "--global", "--unset", "http.proxy"], env=enhanced_path_env())
+                subprocess.run(["git", "config", "--global", "--unset", "https.proxy"], env=enhanced_path_env())
                 self.log_msg("git: proxy unset")
                 messagebox.showinfo("git", "git proxy выключен.")
         except FileNotFoundError:
             messagebox.showerror("Ошибка", "git не найден в PATH.")
+
+    # ---- IDE integrated-terminal proxy ----
+
+    def _ide_settings_paths(self) -> list:
+        """Список (имя, settings.json) для VSCode/Cursor/VSCodium на текущей платформе."""
+        if IS_MAC:
+            base = Path.home() / "Library" / "Application Support"
+        elif IS_WIN:
+            base = Path(os.environ.get("APPDATA", str(Path.home())))
+        else:
+            base = Path.home() / ".config"
+        return [
+            ("VSCode",   base / "Code" / "User" / "settings.json"),
+            ("Cursor",   base / "Cursor" / "User" / "settings.json"),
+            ("VSCodium", base / "VSCodium" / "User" / "settings.json"),
+        ]
+
+    @staticmethod
+    def _strip_jsonc(text: str) -> str:
+        """Убрать // и /* */ из JSONC, сохраняя содержимое строк."""
+        out = []
+        i = 0
+        in_str = False
+        n = len(text)
+        while i < n:
+            c = text[i]
+            if in_str:
+                if c == "\\" and i + 1 < n:
+                    out.append(c); out.append(text[i + 1]); i += 2; continue
+                if c == '"':
+                    in_str = False
+                out.append(c); i += 1; continue
+            if c == '"':
+                in_str = True
+                out.append(c); i += 1; continue
+            if c == "/" and i + 1 < n and text[i + 1] == "/":
+                while i < n and text[i] != "\n":
+                    i += 1
+                continue
+            if c == "/" and i + 1 < n and text[i + 1] == "*":
+                i += 2
+                while i + 1 < n:
+                    if text[i] == "*" and text[i + 1] == "/":
+                        i += 2
+                        break
+                    i += 1
+                continue
+            out.append(c); i += 1
+        return "".join(out)
+
+    def _patch_ide_settings(self, path: Path, proxy_url: str, enable: bool) -> None:
+        if not path.exists():
+            if not enable:
+                return
+            path.parent.mkdir(parents=True, exist_ok=True)
+            data = {}
+        else:
+            text = path.read_text(encoding="utf-8")
+            if not text.strip():
+                data = {}
+            else:
+                try:
+                    data = json.loads(self._strip_jsonc(text))
+                except json.JSONDecodeError:
+                    bak = path.with_suffix(path.suffix + ".broken.bak")
+                    bak.write_bytes(path.read_bytes())
+                    self.log_msg(f"{path.name} битый — забэкапил в {bak.name}, начинаю с пустых настроек")
+                    data = {}
+            # backup before overwrite
+            bak = path.with_suffix(path.suffix + ".bak")
+            if not bak.exists():
+                bak.write_bytes(path.read_bytes())
+
+        env_key = "terminal.integrated.env.osx" if IS_MAC else \
+                  "terminal.integrated.env.windows" if IS_WIN else \
+                  "terminal.integrated.env.linux"
+
+        if enable:
+            env = data.get(env_key)
+            if not isinstance(env, dict):
+                env = {}
+            env["HTTPS_PROXY"] = proxy_url
+            env["HTTP_PROXY"] = proxy_url
+            env["ALL_PROXY"] = proxy_url
+            env["NO_PROXY"] = "localhost,127.0.0.1"
+            data[env_key] = env
+            data["http.proxy"] = proxy_url
+            data["http.proxyStrictSSL"] = True
+        else:
+            env = data.get(env_key)
+            if isinstance(env, dict):
+                for k in ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "NO_PROXY"):
+                    env.pop(k, None)
+                if env:
+                    data[env_key] = env
+                else:
+                    data.pop(env_key, None)
+            else:
+                data.pop(env_key, None)
+            data.pop("http.proxy", None)
+            data.pop("http.proxyStrictSSL", None)
+
+        path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    def toggle_ide_terminals(self, enable: bool) -> None:
+        proxy_url = ""
+        if enable:
+            active = self._selected_or_first_proxy()
+            if not active:
+                messagebox.showwarning(
+                    "Подключи прокси",
+                    "Чтобы прописать прокси в settings IDE, сначала подключи ключ.",
+                )
+                return
+            proxy_url = f"http://{active['addr']}"
+
+        patched = []
+        skipped = []
+        for name, p in self._ide_settings_paths():
+            try:
+                # IDE считаем установленным если есть .../User/ папка ИЛИ
+                # пользователь жмёт «on» (тогда мы её создадим)
+                if not p.parent.exists() and not enable:
+                    continue
+                self._patch_ide_settings(p, proxy_url, enable)
+                patched.append(name)
+                self.log_msg(f"{name}: terminals proxy {'on' if enable else 'off'} ({p})")
+            except Exception as e:
+                skipped.append(f"{name}: {e}")
+                self.log_msg(f"{name}: ошибка — {e}")
+
+        action = "включён" if enable else "выключен"
+        if patched:
+            msg = f"Прокси для integrated terminals {action} в:\n  • " + "\n  • ".join(patched)
+            if enable:
+                msg += f"\n\nProxy URL: {proxy_url}"
+                msg += "\n\nЧтобы применилось:\n• Закрой " + ", ".join(patched) + " (Cmd+Q)\n• Открой снова через ZubriTunnel"
+            if skipped:
+                msg += "\n\nС ошибкой:\n  • " + "\n  • ".join(skipped)
+            messagebox.showinfo("Готово", msg)
+        elif skipped:
+            messagebox.showerror("Ошибка", "Не удалось пропатчить:\n  • " + "\n  • ".join(skipped))
+        else:
+            messagebox.showinfo("IDE не найдены",
+                "Не нашёл VSCode / Cursor / VSCodium в стандартных местах.\n\n"
+                "Если ты их используешь — открой их хотя бы раз, чтобы создались папки настроек.")
 
     # ---- log / status ----
 
