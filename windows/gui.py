@@ -797,6 +797,29 @@ class RoundedCard(tk.Frame):
 APP_NAME = "ZubriTunnel"
 SETTINGS_FILE = SCRIPT_DIR / "settings.json"
 
+
+def read_app_version() -> str:
+    """Get app version. CI writes the tag (e.g. '1.0.36') into VERSION file
+    next to gui.py before packaging — so the GUI can show 'which build is this'."""
+    for cand in (
+        BUNDLE_DIR / "VERSION",                       # PyInstaller --add-data target
+        SCRIPT_DIR / "VERSION",                       # next to .exe / gui.py
+        SCRIPT_DIR.parent / "VERSION",
+        BUNDLE_DIR.parent / "VERSION",
+        BUNDLE_DIR.parent / "Resources" / "VERSION",  # .app/Contents/Resources
+    ):
+        try:
+            if cand.is_file():
+                v = cand.read_text(encoding="utf-8").strip()
+                if v:
+                    return v
+        except Exception:
+            pass
+    return "dev"
+
+
+APP_VERSION = read_app_version()
+
 DARK_COLORS = {
     "bg":       "#161616",
     "panel":    "#1E1E1E",
@@ -1251,6 +1274,8 @@ class App(tk.Tk):
         head.pack(fill="x", pady=(0, 14))
         tk.Label(head, text=APP_NAME, bg=COLORS["bg"], fg=COLORS["text"],
                  font=UI_FONT_TITLE).pack(side="left")
+        tk.Label(head, text=f"v{APP_VERSION}", bg=COLORS["bg"],
+                 fg=COLORS["muted"], font=UI_FONT).pack(side="left", padx=(8, 0))
         tk.Label(head, text="• точечный VPN для приложений", bg=COLORS["bg"],
                  fg=COLORS["muted"], font=UI_FONT).pack(side="left", padx=8)
         self.theme_var = tk.StringVar(value=self.theme_mode)
