@@ -75,26 +75,40 @@ def sanitize_json_bytes(data: bytes) -> bytes:
 
 
 def find_openvpn_binary() -> str | None:
-    """Find an installed OpenVPN client binary. Returns absolute path or None."""
-    p = shutil.which("openvpn")
-    if p:
-        return p
+    """Find an OpenVPN client binary. Order:
+       1. Bundled inside ZubriTunnel (CI ships it)
+       2. System install (Homebrew / official installer / Tunnelblick)
+       3. PATH
+    Returns absolute path or None."""
+    # 1. Bundled
+    if os.name == "nt":
+        bundled = SCRIPT_DIR / "openvpn" / "openvpn.exe"
+        if bundled.is_file():
+            return str(bundled)
+    elif sys.platform == "darwin":
+        # In .app bundle: Frameworks/openvpn (sibling of MacOS/)
+        for cand in (
+            SCRIPT_DIR.parent / "Frameworks" / "openvpn",
+            BUNDLE_DIR.parent / "Frameworks" / "openvpn",
+        ):
+            try:
+                if cand.is_file():
+                    return str(cand)
+            except Exception:
+                pass
+
+    # 2. System install
     candidates = [
-        # Windows — official OpenVPN community installer locations
         r"C:\Program Files\OpenVPN\bin\openvpn.exe",
         r"C:\Program Files (x86)\OpenVPN\bin\openvpn.exe",
-        # Tunnelblick on macOS bundles its own openvpn binaries inside the .app
-        "/Applications/Tunnelblick.app/Contents/Resources/openvpn/openvpn-2.6.14-openssl-3.2.4/openvpn",
-        # Homebrew
         "/opt/homebrew/sbin/openvpn",
         "/usr/local/sbin/openvpn",
-        # System
         "/usr/sbin/openvpn",
     ]
     for c in candidates:
         if os.path.isfile(c):
             return c
-    # Tunnelblick has versioned subdirs; glob the latest
+    # Tunnelblick versioned subdirs
     if sys.platform == "darwin":
         try:
             import glob
@@ -103,7 +117,9 @@ def find_openvpn_binary() -> str | None:
                 return matches[-1]
         except Exception:
             pass
-    return None
+
+    # 3. PATH
+    return shutil.which("openvpn")
 
 
 def find_go_binary() -> str | None:

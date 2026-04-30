@@ -35,6 +35,22 @@ jobs:
           rsrc -ico icon.ico -manifest "" -o rsrc_windows.syso
           go build -o vpn-proxy.exe .
 
+      - name: Bundle OpenVPN community client + Wintun (no driver install needed)
+        shell: pwsh
+        run: |
+          $url = "https://swupdate.openvpn.net/community/releases/OpenVPN-2.6.12-I001-amd64.msi"
+          Invoke-WebRequest $url -OutFile ovpn.msi -UseBasicParsing
+          choco install lessmsi -y --no-progress
+          $env:Path += ";C:\ProgramData\chocolatey\lib\lessmsi\tools\lessmsi"
+          lessmsi x ovpn.msi .\ovpn-extract\
+          New-Item -ItemType Directory -Force -Path windows\openvpn | Out-Null
+          # Copy the binary, Wintun driver DLL (no install needed), and license
+          Copy-Item ovpn-extract\SourceDir\OpenVPN\bin\openvpn.exe windows\openvpn\
+          Copy-Item ovpn-extract\SourceDir\OpenVPN\bin\wintun.dll windows\openvpn\ -ErrorAction SilentlyContinue
+          # GPL: ship the license text alongside
+          Copy-Item ovpn-extract\SourceDir\OpenVPN\share\doc\license.txt windows\openvpn\LICENSE-OpenVPN.txt -ErrorAction SilentlyContinue
+          Get-ChildItem windows\openvpn\
+
       - name: Set up Python for PyInstaller
         uses: actions/setup-python@v5
         with:
@@ -70,6 +86,7 @@ jobs:
             'windows\run.bat',
             'windows\run.ps1',
             'windows\keys',
+            'windows\openvpn',
             'README.md',
             'VERSION'
           )
@@ -116,6 +133,27 @@ jobs:
           lipo -create /tmp/vpn-proxy-arm64 /tmp/vpn-proxy-x86_64 -output "$MACOS/vpn-proxy"
           chmod +x "$MACOS/vpn-proxy"
           file "$MACOS/vpn-proxy"
+
+      - name: Bundle OpenVPN binary (universal arm64+x86_64) from Tunnelblick
+        run: |
+          # Tunnelblick bundles a pre-compiled universal openvpn binary, Apple-signed
+          # by jkbullard. Extract it into our .app's Frameworks/.
+          curl -L -o tb.dmg "https://tunnelblick.net/release/Tunnelblick_7.0_build_5980.dmg"
+          hdiutil attach tb.dmg -mountpoint /Volumes/TB -nobrowse -quiet
+          OVPN="$(find /Volumes/TB/Tunnelblick.app/Contents/Resources/openvpn -name openvpn -type f | sort -V | tail -1)"
+          if [ -z "$OVPN" ]; then
+            echo "openvpn binary not found in Tunnelblick"
+            ls -R /Volumes/TB/Tunnelblick.app/Contents/Resources/openvpn || true
+            exit 1
+          fi
+          FW="mac/ZubriTunnel.app/Contents/Frameworks"
+          mkdir -p "$FW"
+          cp "$OVPN" "$FW/openvpn"
+          chmod +x "$FW/openvpn"
+          file "$FW/openvpn"
+          hdiutil detach /Volumes/TB -quiet || true
+          # Re-sign ad-hoc — pkgbuild later may strip it, postinstall script will re-sign anyway
+          codesign --force --options runtime --sign - "$FW/openvpn" || true
 
       - name: Bundle standalone Python (arm64 + x86_64)
         run: |
