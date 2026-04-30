@@ -42,13 +42,20 @@ jobs:
           Invoke-WebRequest $url -OutFile ovpn.msi -UseBasicParsing
           choco install lessmsi -y --no-progress
           $env:Path += ";C:\ProgramData\chocolatey\lib\lessmsi\tools\lessmsi"
-          lessmsi x ovpn.msi .\ovpn-extract\
+          # Use absolute paths — lessmsi on Windows chokes on .\ovpn-extract\ syntax
+          $extract = Join-Path $PWD "ovpn-extract"
+          New-Item -ItemType Directory -Force -Path $extract | Out-Null
+          lessmsi x ovpn.msi "$extract\"
+          # Find the extracted files (lessmsi may put them under SourceDir or directly)
+          Get-ChildItem -Recurse $extract | Select-Object -First 30 FullName
           New-Item -ItemType Directory -Force -Path windows\openvpn | Out-Null
-          # Copy the binary, Wintun driver DLL (no install needed), and license
-          Copy-Item ovpn-extract\SourceDir\OpenVPN\bin\openvpn.exe windows\openvpn\
-          Copy-Item ovpn-extract\SourceDir\OpenVPN\bin\wintun.dll windows\openvpn\ -ErrorAction SilentlyContinue
-          # GPL: ship the license text alongside
-          Copy-Item ovpn-extract\SourceDir\OpenVPN\share\doc\license.txt windows\openvpn\LICENSE-OpenVPN.txt -ErrorAction SilentlyContinue
+          $exe   = Get-ChildItem -Recurse $extract -Filter openvpn.exe | Select-Object -First 1
+          $dll   = Get-ChildItem -Recurse $extract -Filter wintun.dll  | Select-Object -First 1
+          $lic   = Get-ChildItem -Recurse $extract -Filter license.txt | Select-Object -First 1
+          if (-not $exe) { Write-Error "openvpn.exe not found in extracted MSI"; exit 1 }
+          Copy-Item $exe.FullName windows\openvpn\openvpn.exe
+          if ($dll) { Copy-Item $dll.FullName windows\openvpn\wintun.dll }
+          if ($lic) { Copy-Item $lic.FullName windows\openvpn\LICENSE-OpenVPN.txt }
           Get-ChildItem windows\openvpn\
 
       - name: Set up Python for PyInstaller
@@ -136,23 +143,33 @@ jobs:
 
       - name: Bundle OpenVPN binary (universal arm64+x86_64) from Tunnelblick
         run: |
-          # Tunnelblick bundles a pre-compiled universal openvpn binary, Apple-signed
-          # by jkbullard. Extract it into our .app's Frameworks/.
-          curl -L -o tb.dmg "https://tunnelblick.net/release/Tunnelblick_7.0_build_5980.dmg"
+          # Tunnelblick bundles pre-compiled universal openvpn binaries, Apple-signed
+          # by jkbullard. Extract one into our .app's Frameworks/.
+          curl -fL -o tb.dmg "https://tunnelblick.net/iprelease/Tunnelblick_8.0.1_build_6301.dmg"
+          ls -la tb.dmg
+          file tb.dmg
           hdiutil attach tb.dmg -mountpoint /Volumes/TB -nobrowse -quiet
-          OVPN="$(find /Volumes/TB/Tunnelblick.app/Contents/Resources/openvpn -name openvpn -type f | sort -V | tail -1)"
-          if [ -z "$OVPN" ]; then
-            echo "openvpn binary not found in Tunnelblick"
-            ls -R /Volumes/TB/Tunnelblick.app/Contents/Resources/openvpn || true
+          ls /Volumes/TB
+          # Tunnelblick mounts as 'Tunnelblick' or 'Tunnelblick X.Y'
+          TB_APP="$(find /Volumes/TB -maxdepth 2 -name 'Tunnelblick.app' -type d | head -1)"
+          if [ -z "$TB_APP" ]; then
+            echo "Tunnelblick.app not found on mounted DMG"
+            ls -R /Volumes/TB || true
             exit 1
           fi
+          OVPN="$(find "$TB_APP/Contents/Resources/openvpn" -name openvpn -type f 2>/dev/null | sort -V | tail -1)"
+          if [ -z "$OVPN" ]; then
+            echo "openvpn binary not found inside Tunnelblick.app"
+            ls -R "$TB_APP/Contents/Resources/openvpn" || true
+            exit 1
+          fi
+          echo "found openvpn at: $OVPN"
           FW="mac/ZubriTunnel.app/Contents/Frameworks"
           mkdir -p "$FW"
           cp "$OVPN" "$FW/openvpn"
           chmod +x "$FW/openvpn"
           file "$FW/openvpn"
           hdiutil detach /Volumes/TB -quiet || true
-          # Re-sign ad-hoc — pkgbuild later may strip it, postinstall script will re-sign anyway
           codesign --force --options runtime --sign - "$FW/openvpn" || true
 
       - name: Bundle standalone Python (arm64 + x86_64)
