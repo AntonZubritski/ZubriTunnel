@@ -1016,6 +1016,12 @@ class App(tk.Tk):
         except Exception:
             pass
 
+    def _scaled_geom(self, w: int, h: int) -> str:
+        """DPI-scaled geometry string for Toplevel dialogs. Без него на 2x экране
+        диалоги получают физические 520×180 пикселей, в которые не влезает контент."""
+        s = getattr(self, "_dpi_scale", 1.0)
+        return f"{int(w * s)}x{int(h * s)}"
+
     def _detect_dpi_scale(self) -> float:
         """Return DPI scale factor (1.0 = 96 DPI = 100%)."""
         if os.name == "nt":
@@ -1328,7 +1334,7 @@ class App(tk.Tk):
         win.title(title)
         win.transient(self)
         win.grab_set()
-        win.geometry("520x180")
+        win.geometry(self._scaled_geom(520, 180))
         win.resizable(True, False)
 
         ttk.Label(win, text=prompt, justify="left", wraplength=480).pack(fill="x", padx=12, pady=(12, 6))
@@ -1370,7 +1376,7 @@ class App(tk.Tk):
     def add_json(self):
         win = tk.Toplevel(self)
         win.title("Вставь JSON ключа")
-        win.geometry("520x320")
+        win.geometry(self._scaled_geom(520, 320))
         txt = scrolledtext.ScrolledText(win, font=("Courier", 9))
         txt.pack(fill="both", expand=True, padx=8, pady=8)
         txt.insert("1.0", '{\n  "method": "chacha20-ietf-poly1305",\n  "password": "...",\n  "server": "1.2.3.4",\n  "server_port": 443,\n  "tag": "Country"\n}\n')
@@ -1432,7 +1438,7 @@ class App(tk.Tk):
             return
         win = tk.Toplevel(self)
         win.title(f"Приложения через «{k['name']}»")
-        win.geometry("560x360")
+        win.geometry(self._scaled_geom(560, 360))
         win.transient(self)
         apply_theme(win)
         win.configure(bg=COLORS["bg"])
@@ -1553,7 +1559,7 @@ class App(tk.Tk):
     def _render_region_dialog(self, k: dict, ssconf_url: str, locations: list):
         win = tk.Toplevel(self)
         win.title(f"Сменить регион — {k['name']}")
-        win.geometry("520x420")
+        win.geometry(self._scaled_geom(520, 420))
         win.transient(self)
 
         ttk.Label(win, text=f"Текущий регион: {k['tag']}", anchor="w").pack(fill="x", padx=10, pady=(10, 4))
@@ -2342,7 +2348,7 @@ class App(tk.Tk):
         """Окно «Проверка системы» — список зависимостей со статусом и кнопками установки."""
         win = tk.Toplevel(self)
         win.title("Системные зависимости")
-        win.geometry("680x500")
+        win.geometry(self._scaled_geom(680, 500))
         win.transient(self)
         win.configure(bg=COLORS["bg"])
         win.after(50, lambda: apply_dark_titlebar(win, self.actual_theme == "dark"))
@@ -2482,7 +2488,7 @@ class App(tk.Tk):
             return
         win = tk.Toplevel(self)
         win.title(f"{APP_NAME} — лог")
-        win.geometry("780x500")
+        win.geometry(self._scaled_geom(780, 500))
         win.configure(bg=COLORS["bg"])
         # Apply dark titlebar to popup too
         win.after(50, lambda: apply_dark_titlebar(win, self.actual_theme == "dark"))
