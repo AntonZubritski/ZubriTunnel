@@ -4,6 +4,7 @@ from __future__ import annotations  # allow `dict[str, dict]` / `T | None` on Py
 import json
 import os
 import platform
+import shlex
 import shutil
 import signal
 import socket
@@ -71,6 +72,38 @@ def sanitize_json_bytes(data: bytes) -> bytes:
             continue
         out.append(b)
     return bytes(out)
+
+
+def find_openvpn_binary() -> str | None:
+    """Find an installed OpenVPN client binary. Returns absolute path or None."""
+    p = shutil.which("openvpn")
+    if p:
+        return p
+    candidates = [
+        # Windows — official OpenVPN community installer locations
+        r"C:\Program Files\OpenVPN\bin\openvpn.exe",
+        r"C:\Program Files (x86)\OpenVPN\bin\openvpn.exe",
+        # Tunnelblick on macOS bundles its own openvpn binaries inside the .app
+        "/Applications/Tunnelblick.app/Contents/Resources/openvpn/openvpn-2.6.14-openssl-3.2.4/openvpn",
+        # Homebrew
+        "/opt/homebrew/sbin/openvpn",
+        "/usr/local/sbin/openvpn",
+        # System
+        "/usr/sbin/openvpn",
+    ]
+    for c in candidates:
+        if os.path.isfile(c):
+            return c
+    # Tunnelblick has versioned subdirs; glob the latest
+    if sys.platform == "darwin":
+        try:
+            import glob
+            matches = sorted(glob.glob("/Applications/Tunnelblick.app/Contents/Resources/openvpn/*/openvpn"))
+            if matches:
+                return matches[-1]
+        except Exception:
+            pass
+    return None
 
 
 def find_go_binary() -> str | None:
@@ -185,6 +218,43 @@ def go_command() -> list:
     # Fall back to "go run ." using absolute path so PATH-less subprocesses still find it
     go = find_go_binary() or "go"
     return [go, "run", "."]
+
+
+def parse_ovpn_config(text: str) -> dict:
+    """Quick parser for .ovpn — extracts the key fields ZubriTunnel cares about
+    (server, port, protocol). The full config text is preserved so that on
+    connect we just write it out and feed to openvpn unchanged."""
+    server = None
+    port = None
+    proto = "udp"
+    auth = "none"
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or line.startswith(";"):
+            continue
+        parts = line.split()
+        if not parts:
+            continue
+        if parts[0] == "remote" and len(parts) >= 2:
+            server = parts[1]
+            if len(parts) >= 3 and parts[2].isdigit():
+                port = int(parts[2])
+        elif parts[0] == "proto" and len(parts) >= 2:
+            proto = parts[1]
+        elif parts[0] == "port" and len(parts) >= 2 and not port:
+            try:
+                port = int(parts[1])
+            except ValueError:
+                pass
+        elif parts[0] == "auth-user-pass":
+            auth = "user-pass"
+    return {
+        "type": "ovpn",
+        "server": server or "?",
+        "server_port": port or 1194,
+        "proto": proto,
+        "auth": auth,
+    }
 
 
 def fetch_ssconf(url: str) -> dict:
@@ -1201,6 +1271,7 @@ class App(tk.Tk):
             ("+ ssconf://", self.add_ssconf),
             ("+ JSON", self.add_json),
             ("+ файл…", self.add_file),
+            ("+ .ovpn", self.add_ovpn_file),
             ("клонировать", self.clone_key),
             ("сменить регион", self.change_region),
         ]:
@@ -1430,6 +1501,41 @@ class App(tk.Tk):
             messagebox.showerror("Ошибка", f"Не парсится: {e}")
             return
         self._save_key(data, data.get("tag") or Path(f).stem)
+
+    def add_ovpn_file(self):
+        """Импорт .ovpn файла. Сохраняем сырой конфиг + парсим server/port для отображения."""
+        f = filedialog.askopenfilename(
+            title="OpenVPN config (.ovpn)",
+            filetypes=[("OpenVPN", "*.ovpn"), ("All", "*.*")],
+        )
+        if not f:
+            return
+        try:
+            text = Path(f).read_text(encoding="utf-8", errors="replace")
+        except Exception as e:
+            messagebox.showerror("Ошибка", f"Не удалось прочитать файл: {e}")
+            return
+        meta = parse_ovpn_config(text)
+        if meta["server"] == "?":
+            messagebox.showerror("Не похоже на .ovpn", "В файле нет строки 'remote <host> <port>'.")
+            return
+        # Сохраняем как наш JSON-ключ с type=ovpn и сырым конфигом внутри.
+        data = dict(meta)
+        data["tag"] = data.get("tag") or Path(f).stem
+        data["ovpn_config"] = text  # raw text, will be re-written to tmp on connect
+        self._save_key(data, Path(f).stem)
+        # Подсказка про OpenVPN-клиент
+        if not find_openvpn_binary():
+            messagebox.showinfo(
+                "OpenVPN-клиент не найден",
+                "Чтобы запускать .ovpn ключи, установи OpenVPN-клиент:\n\n"
+                "  • Mac:  brew install openvpn\n"
+                "  • Win:  https://openvpn.net/community-downloads/\n\n"
+                "После установки нажми «Подключить».\n\n"
+                "Альтернатива на Mac — установить Tunnelblick:\n"
+                "  https://tunnelblick.net/downloads.html\n"
+                "ZubriTunnel найдёт встроенный в Tunnelblick openvpn автоматически."
+            )
 
     def clone_key(self):
         k = self.selected_key()
@@ -1771,9 +1877,23 @@ class App(tk.Tk):
             return
         existing = self.proxies.get(k["name"])
         if existing and existing["proc"].poll() is None:
-            messagebox.showinfo("Уже подключён", f"{k['name']} уже работает на {existing['addr']}.")
+            messagebox.showinfo("Уже подключён", f"{k['name']} уже работает.")
             return
-        # find a free port avoiding ports already used by other running proxies
+        # Routing: shadowsocks vs OpenVPN (type=ovpn) need different connect paths.
+        key_type = (k.get("type") or "").lower()
+        # Re-read full key data to get ovpn_config blob if needed
+        try:
+            raw = json.loads(sanitize_json_bytes(k["path"].read_bytes()).decode("utf-8", errors="replace"))
+            if (raw.get("type") or "").lower() == "ovpn":
+                key_type = "ovpn"
+        except Exception:
+            raw = {}
+
+        if key_type == "ovpn":
+            self._connect_ovpn(k, raw)
+            return
+
+        # ---- standard shadowsocks ----
         free = find_free_port("127.0.0.1", 8080, avoid=self._used_local_ports())
         addr = f"127.0.0.1:{free}"
         proc = self._start_proxy_subprocess(k["name"], addr)
@@ -1782,6 +1902,121 @@ class App(tk.Tk):
         self.proxies[k["name"]] = {"proc": proc, "addr": addr, "key_tag": k["tag"] or k["name"]}
         self._update_status_display()
         threading.Thread(target=self._wait_listening, args=(proc, k, addr), daemon=True).start()
+
+    def _connect_ovpn(self, k: dict, raw: dict):
+        """Connect via OpenVPN — system-wide tunnel.
+        Currently spawns the OS's installed openvpn binary with elevation
+        (UAC on Windows, sudo prompt on macOS). The connection covers ALL
+        system traffic — per-app routing buttons are no-ops while ovpn is up."""
+        ovpn_text = raw.get("ovpn_config")
+        if not ovpn_text:
+            messagebox.showerror("Битый ключ",
+                "В JSON ключе нет поля 'ovpn_config'. Удали и импортируй .ovpn заново.")
+            return
+        ovpn_bin = find_openvpn_binary()
+        if not ovpn_bin:
+            messagebox.showerror(
+                "OpenVPN не установлен",
+                "Поставь OpenVPN-клиент:\n\n"
+                "  • Mac:  brew install openvpn  (или скачай Tunnelblick)\n"
+                "  • Win:  https://openvpn.net/community-downloads/\n\n"
+                "После установки попробуй ещё раз."
+            )
+            return
+
+        # Write the ovpn config to a temp file so we can pass --config <path>
+        import tempfile
+        tmp = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".ovpn", delete=False, encoding="utf-8",
+            prefix=f"zubri-{k['name']}-",
+        )
+        tmp.write(ovpn_text)
+        tmp.close()
+        cfg_path = tmp.name
+        log_path = cfg_path + ".log"
+
+        proc = self._spawn_ovpn(ovpn_bin, cfg_path, log_path)
+        if not proc:
+            try: os.unlink(cfg_path)
+            except OSError: pass
+            return
+        self.proxies[k["name"]] = {
+            "proc": proc, "addr": "system-wide", "key_tag": k["tag"] or k["name"],
+            "type": "ovpn", "config_path": cfg_path, "log_path": log_path,
+        }
+        self.log_msg(f"{k['name']}: OpenVPN запущен (system-wide). Лог: {log_path}")
+        self._update_status_display()
+        # Watch the log for "Initialization Sequence Completed"
+        threading.Thread(target=self._wait_ovpn_ready, args=(k, log_path), daemon=True).start()
+
+    def _spawn_ovpn(self, ovpn_bin: str, cfg_path: str, log_path: str):
+        """Запустить openvpn с elevation. Возвращает Popen-подобный объект (на Windows
+        это launcher-процесс PowerShell; на Mac — sh с osascript). Реальный openvpn
+        работает как root."""
+        cfg_dir = os.path.dirname(cfg_path)
+        if IS_WIN:
+            # PowerShell Start-Process -Verb RunAs показывает UAC prompt
+            ps = (
+                f'$p = Start-Process -FilePath \'{ovpn_bin}\' '
+                f'-ArgumentList \'--config\',\'{cfg_path}\',\'--log\',\'{log_path}\' '
+                f'-WorkingDirectory \'{cfg_dir}\' -Verb RunAs -PassThru -WindowStyle Hidden; '
+                f'$p.Id'
+            )
+            try:
+                proc = subprocess.Popen(
+                    ["powershell", "-NoProfile", "-Command", ps],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    text=True, **_win_subprocess_kwargs(),
+                )
+                return proc
+            except Exception as e:
+                messagebox.showerror("Ошибка запуска OpenVPN", str(e))
+                return None
+        elif IS_MAC:
+            # osascript with administrator privileges запросит пароль через native dialog
+            cmd = f"{shlex.quote(ovpn_bin)} --config {shlex.quote(cfg_path)} --log {shlex.quote(log_path)} --daemon"
+            applescript = (
+                f'do shell script "{cmd}" '
+                f'with administrator privileges '
+                f'with prompt "ZubriTunnel хочет запустить OpenVPN — нужен пароль администратора"'
+            )
+            try:
+                proc = subprocess.Popen(
+                    ["osascript", "-e", applescript],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                )
+                return proc
+            except Exception as e:
+                messagebox.showerror("Ошибка запуска OpenVPN", str(e))
+                return None
+        else:
+            messagebox.showerror("Не поддерживается", "OpenVPN на Linux пока не интегрирован.")
+            return None
+
+    def _wait_ovpn_ready(self, k: dict, log_path: str):
+        """Парсим лог OpenVPN до 'Initialization Sequence Completed' = коннект готов."""
+        import time as _t
+        deadline = _t.time() + 30
+        while _t.time() < deadline:
+            try:
+                if os.path.exists(log_path):
+                    text = Path(log_path).read_text(encoding="utf-8", errors="replace")
+                    if "Initialization Sequence Completed" in text:
+                        self.after(0, lambda: (
+                            self.log_msg(f"{k['name']}: VPN tunnel up — system-wide"),
+                            self._update_status_display(),
+                            self.refresh_keys(),
+                        ))
+                        return
+                    if "AUTH_FAILED" in text or "Cannot allocate TUN" in text:
+                        snippet = "\n".join(text.splitlines()[-10:])
+                        self.after(0, lambda s=snippet: messagebox.showerror(
+                            "OpenVPN ошибка", f"Сбой подключения:\n\n{s}"))
+                        return
+            except Exception:
+                pass
+            _t.sleep(1.0)
+        self.log_msg(f"{k['name']}: timed out waiting for VPN tunnel — see {log_path}")
 
     def _wait_listening(self, proc: subprocess.Popen, k: dict, addr: str):
         marker = f"listening on http://{addr}"
