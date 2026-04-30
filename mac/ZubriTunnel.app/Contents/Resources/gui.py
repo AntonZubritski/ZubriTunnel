@@ -497,6 +497,49 @@ class RoundButton(tk.Canvas):
         self._draw()
 
 
+class FlowFrame(tk.Frame):
+    """Контейнер с flex-wrap layout: дочерние виджеты переносятся на новую строку
+    когда не помещаются по ширине. Аналог `display: flex; flex-wrap: wrap;` в CSS."""
+
+    def __init__(self, parent, hgap: int = 6, vgap: int = 6, **kw):
+        super().__init__(parent, **kw)
+        self._hgap = hgap
+        self._vgap = vgap
+        self._items = []
+        self.bind("<Configure>", lambda _e: self._reflow())
+
+    def add(self, widget):
+        self._items.append(widget)
+        widget.place(in_=self, x=0, y=0)  # initial pos; _reflow корректирует
+        self.after_idle(self._reflow)
+
+    def _reflow(self):
+        width = self.winfo_width()
+        if width <= 1:
+            self.after(50, self._reflow)
+            return
+        x = 0
+        y = 0
+        row_h = 0
+        for w in self._items:
+            try:
+                w.update_idletasks()
+                bw = w.winfo_reqwidth() or w.winfo_width()
+                bh = w.winfo_reqheight() or w.winfo_height()
+            except tk.TclError:
+                continue
+            if x + bw > width and x > 0:
+                x = 0
+                y += row_h + self._vgap
+                row_h = 0
+            w.place(in_=self, x=x, y=y)
+            x += bw + self._hgap
+            row_h = max(row_h, bh)
+        new_height = y + row_h + 2
+        if abs(self.winfo_height() - new_height) > 2:
+            self.configure(height=new_height)
+
+
 class RoundedCard(tk.Frame):
     """Frame with rounded-rect background drawn behind. Body is inset so the
     rounded corners actually show — otherwise the rectangular body Frame would
@@ -1090,19 +1133,23 @@ class App(tk.Tk):
     def _build_launch_buttons(self):
         for w in self.launch_frame.winfo_children():
             w.destroy()
+        # FlowFrame — автоперенос кнопок когда окно узкое (как flex-wrap)
+        flow = FlowFrame(self.launch_frame, bg=COLORS["panel"], hgap=6, vgap=6)
+        flow.pack(fill="x", expand=True)
         for name, cmd in detect_apps():
-            RoundButton(self.launch_frame, text=name, variant="tool",
-                        command=lambda c=cmd, n=name: self.launch_app(n, c)).pack(side="left", padx=(0, 6), pady=2)
-        RoundButton(self.launch_frame, text="Custom…", variant="tool",
-                    command=self.launch_custom).pack(side="left", padx=(0, 6), pady=2)
-        RoundButton(self.launch_frame, text="git proxy on", variant="tool",
-                    command=lambda: self.toggle_git_proxy(True)).pack(side="left", padx=(14, 6), pady=2)
-        RoundButton(self.launch_frame, text="git proxy off", variant="tool",
-                    command=lambda: self.toggle_git_proxy(False)).pack(side="left", padx=(0, 6), pady=2)
-        RoundButton(self.launch_frame, text="IDE terminals on", variant="tool",
-                    command=lambda: self.toggle_ide_terminals(True)).pack(side="left", padx=(14, 6), pady=2)
-        RoundButton(self.launch_frame, text="IDE terminals off", variant="tool",
-                    command=lambda: self.toggle_ide_terminals(False)).pack(side="left", padx=(0, 6), pady=2)
+            btn = RoundButton(flow, text=name, variant="tool",
+                              command=lambda c=cmd, n=name: self.launch_app(n, c))
+            flow.add(btn)
+        flow.add(RoundButton(flow, text="Custom…", variant="tool", command=self.launch_custom))
+        # Action buttons (git, IDE terminals) — тоже в flow, но они есть всегда
+        flow.add(RoundButton(flow, text="git proxy on", variant="tool",
+                             command=lambda: self.toggle_git_proxy(True)))
+        flow.add(RoundButton(flow, text="git proxy off", variant="tool",
+                             command=lambda: self.toggle_git_proxy(False)))
+        flow.add(RoundButton(flow, text="IDE terminals on", variant="tool",
+                             command=lambda: self.toggle_ide_terminals(True)))
+        flow.add(RoundButton(flow, text="IDE terminals off", variant="tool",
+                             command=lambda: self.toggle_ide_terminals(False)))
 
     # ---- key management ----
 
@@ -1620,6 +1667,48 @@ class App(tk.Tk):
         k = self.selected_key()
         if not k:
             return
+        p = self.proxies.get(k["name"])
+        if p:
+            # Проверим какие приложения через этот прокси ещё живы — иначе
+            # пользователь увидит "VPN отключён" но Chrome продолжит ломиться
+            # на мёртвый 127.0.0.1:8081 и интернет не работает.
+            live_apps = []
+            for entry in p.get("apps", []) or []:
+                rpid = entry.get("real_pid")
+                if rpid:
+                    try:
+                        os.kill(rpid, 0)
+                        live_apps.append(entry)
+                    except (ProcessLookupError, OSError):
+                        pass
+                else:
+                    proc = entry.get("proc")
+                    if proc and proc.poll() is None:
+                        live_apps.append(entry)
+            if live_apps:
+                names = ", ".join(sorted(set(a["name"] for a in live_apps)))
+                if messagebox.askyesno(
+                    "Закрыть приложения через этот прокси?",
+                    f"Сейчас работают: {names}.\n\n"
+                    "Они стартовали с проксированием на этот ключ. После отключения "
+                    "они продолжат работать, но будут пытаться ходить через мёртвый "
+                    "прокси — интернет в них работать не будет.\n\n"
+                    "Закрыть их вместе с отключением?",
+                ):
+                    for entry in live_apps:
+                        rpid = entry.get("real_pid")
+                        try:
+                            if rpid:
+                                import signal as _sig
+                                os.kill(rpid, _sig.SIGTERM)
+                                self.log_msg(f"закрыл {entry['name']} (PID {rpid})")
+                            else:
+                                proc = entry.get("proc")
+                                if proc and proc.poll() is None:
+                                    proc.terminate()
+                                    self.log_msg(f"закрыл {entry['name']}")
+                        except Exception as e:
+                            self.log_msg(f"не закрыл {entry['name']}: {e}")
         self._stop_proxy_for(k["name"])
         self._update_status_display()
 
