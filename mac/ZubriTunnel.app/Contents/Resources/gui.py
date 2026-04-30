@@ -1315,9 +1315,33 @@ class App(tk.Tk):
                       style="Muted.TLabel", justify="left").pack(anchor="w")
         else:
             for entry in apps:
+                # Real status: prefer real_pid (resolved via pgrep for `open -na`),
+                # fall back to subprocess status.
+                real_pid = entry.get("real_pid")
                 proc = entry.get("proc")
-                alive = "● работает" if proc and proc.poll() is None else "○ завершено"
-                tree.insert("", "end", values=(entry["time"], entry["name"], entry.get("pid", "?"), alive))
+                alive = "○ завершено"
+                if real_pid:
+                    try:
+                        os.kill(real_pid, 0)
+                        alive = "● работает"
+                    except (ProcessLookupError, OSError):
+                        pass
+                elif proc and proc.poll() is None:
+                    alive = "● работает"
+                elif entry.get("is_open_launch") and entry.get("app_basename"):
+                    # pgrep didn't resolve yet — best-effort name probe
+                    try:
+                        r = subprocess.run(
+                            ["pgrep", "-x", entry["app_basename"]],
+                            capture_output=True, text=True, timeout=2,
+                        )
+                        if r.stdout.strip():
+                            alive = "● работает"
+                    except Exception:
+                        pass
+                # Show real_pid if we resolved it, otherwise the subprocess pid
+                display_pid = real_pid if real_pid else entry.get("pid", "?")
+                tree.insert("", "end", values=(entry["time"], entry["name"], display_pid, alive))
 
         bar = ttk.Frame(outer)
         bar.pack(fill="x")
@@ -1759,22 +1783,60 @@ class App(tk.Tk):
             else:
                 final_cmd = cmd
             child = subprocess.Popen(final_cmd, env=env)
-            self.log_msg(f"запустил {name}: PID {child.pid}, через {proxy_url}")
-            # Track this app under the proxy's apps list (so the apps dialog can show it)
+            # Track this app under the proxy's apps list
             owner_key = None
             for k_name, p in self.proxies.items():
                 if p is active:
                     owner_key = k_name
                     break
+            is_open_launch = bool(final_cmd) and final_cmd[0] == "open"
+            entry = {
+                "name": name,
+                "pid": child.pid,
+                "proc": child,
+                "real_pid": None,
+                "is_open_launch": is_open_launch,
+                "app_basename": None,
+                "time": time.strftime("%H:%M:%S"),
+            }
+            if is_open_launch:
+                # Утилита `open` сразу выходит — найдём настоящий PID запущенного .app через pgrep
+                for arg in final_cmd:
+                    if isinstance(arg, str) and arg.endswith(".app"):
+                        entry["app_basename"] = Path(arg).stem
+                        break
+                threading.Thread(target=self._resolve_real_pid, args=(entry,), daemon=True).start()
             if owner_key:
-                self.proxies[owner_key].setdefault("apps", []).append({
-                    "name": name,
-                    "pid": child.pid,
-                    "proc": child,
-                    "time": time.strftime("%H:%M:%S"),
-                })
+                self.proxies[owner_key].setdefault("apps", []).append(entry)
+            self.log_msg(f"запустил {name}: PID {child.pid}, через {proxy_url}")
+            # Подсказка про running editor
+            if name_lower in ("vscode", "cursor", "intellij idea", "pycharm", "pycharm ce", "webstorm"):
+                self.log_msg(
+                    f"подсказка: если {name} уже был запущен, integrated terminal "
+                    "не получит прокси-env. Закрой полностью (Cmd+Q) и нажми снова."
+                )
         except Exception as e:
             messagebox.showerror("Ошибка", f"Не удалось запустить {name}: {e}")
+
+    def _resolve_real_pid(self, entry: dict):
+        """После запуска через `open -na` найти настоящий PID приложения через pgrep."""
+        if not entry.get("app_basename"):
+            return
+        time.sleep(1.5)
+        for attempt in range(3):
+            try:
+                r = subprocess.run(
+                    ["pgrep", "-x", entry["app_basename"]],
+                    capture_output=True, text=True, timeout=3,
+                )
+                pids = [int(p) for p in r.stdout.strip().splitlines() if p.strip()]
+                if pids:
+                    # Берём самый свежий процесс (наибольший PID)
+                    entry["real_pid"] = max(pids)
+                    return
+            except Exception:
+                pass
+            time.sleep(1.0)
 
     def _chromium_cmd_with_proxy(self, base_cmd: list, proxy_url: str, brand: str) -> list:
         """Launch Chromium-based browser with isolated profile that actually uses the proxy."""
