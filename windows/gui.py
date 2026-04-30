@@ -278,22 +278,41 @@ def detect_apps() -> list:
                     apps.append((name, [p]))
                     break
     elif IS_MAC:
-        candidates = [
-            ("VSCode",   "/Applications/Visual Studio Code.app/Contents/MacOS/Electron"),
-            ("Cursor",   "/Applications/Cursor.app/Contents/MacOS/Cursor"),
-            ("Terminal", "/System/Applications/Utilities/Terminal.app"),
-            ("iTerm",    "/Applications/iTerm.app"),
-            ("Chrome",   "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
-            ("Firefox",  "/Applications/Firefox.app/Contents/MacOS/firefox"),
-            ("Safari",   "/Applications/Safari.app"),
+        # kind: "binary" — launch direct exe (env vars пропагируются: VSCode и Cursor умеют их читать)
+        #       "open"   — open -na "App.app" (правильный путь для браузеров чтобы --args работал)
+        macs = [
+            ("VSCode",          "/Applications/Visual Studio Code.app/Contents/MacOS/Electron", "binary"),
+            ("Cursor",          "/Applications/Cursor.app/Contents/MacOS/Cursor",                "binary"),
+            ("Sublime",         "/Applications/Sublime Text.app",                                "open"),
+            ("PyCharm",         "/Applications/PyCharm.app",                                     "open"),
+            ("PyCharm CE",      "/Applications/PyCharm CE.app",                                  "open"),
+            ("WebStorm",        "/Applications/WebStorm.app",                                    "open"),
+            ("IntelliJ IDEA",   "/Applications/IntelliJ IDEA.app",                               "open"),
+            ("Terminal",        "/System/Applications/Utilities/Terminal.app",                   "open"),
+            ("iTerm",           "/Applications/iTerm.app",                                       "open"),
+            ("Warp",            "/Applications/Warp.app",                                        "open"),
+            ("Chrome",          "/Applications/Google Chrome.app",                               "open"),
+            ("Firefox",         "/Applications/Firefox.app",                                     "open"),
+            ("Safari",          "/Applications/Safari.app",                                      "open"),
+            ("Edge",            "/Applications/Microsoft Edge.app",                              "open"),
+            ("Brave",           "/Applications/Brave Browser.app",                               "open"),
+            ("Opera",           "/Applications/Opera.app",                                       "open"),
+            ("Vivaldi",         "/Applications/Vivaldi.app",                                     "open"),
+            ("Yandex",          "/Applications/Yandex.app",                                      "open"),
+            ("Arc",             "/Applications/Arc.app",                                         "open"),
+            ("Slack",           "/Applications/Slack.app",                                       "open"),
+            ("Discord",         "/Applications/Discord.app",                                     "open"),
+            ("Telegram",        "/Applications/Telegram.app",                                    "open"),
+            ("Spotify",         "/Applications/Spotify.app",                                     "open"),
+            ("Postman",         "/Applications/Postman.app",                                     "open"),
         ]
-        for name, p in candidates:
+        for name, p, kind in macs:
             if not os.path.exists(p):
                 continue
-            if p.endswith(".app"):
-                apps.append((name, ["open", "-na", p]))
-            else:
+            if kind == "binary":
                 apps.append((name, [p]))
+            else:
+                apps.append((name, ["open", "-na", p]))
     return apps
 
 
