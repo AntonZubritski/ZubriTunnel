@@ -415,17 +415,17 @@ def _system_proxy_macos(host_port):
             if host_port:
                 host, _, port = host_port.partition(":")
                 subprocess.run(["networksetup", "-setwebproxy", svc, host, port],
-                               capture_output=True, timeout=5)
+                               capture_output=True, timeout=5, **_win_subprocess_kwargs())
                 subprocess.run(["networksetup", "-setsecurewebproxy", svc, host, port],
-                               capture_output=True, timeout=5)
+                               capture_output=True, timeout=5, **_win_subprocess_kwargs())
                 subprocess.run(["networksetup", "-setproxybypassdomains", svc,
                                 "localhost", "127.0.0.1", "*.local"],
-                               capture_output=True, timeout=5)
+                               capture_output=True, timeout=5, **_win_subprocess_kwargs())
             else:
                 subprocess.run(["networksetup", "-setwebproxystate", svc, "off"],
-                               capture_output=True, timeout=5)
+                               capture_output=True, timeout=5, **_win_subprocess_kwargs())
                 subprocess.run(["networksetup", "-setsecurewebproxystate", svc, "off"],
-                               capture_output=True, timeout=5)
+                               capture_output=True, timeout=5, **_win_subprocess_kwargs())
         return True, ""
     except Exception as e:
         return False, str(e)
@@ -433,6 +433,21 @@ def _system_proxy_macos(host_port):
 
 def _system_proxy_linux(host_port):
     return False, "Системный прокси на Linux не реализован — поставь руками через GNOME/KDE settings"
+
+
+# Windows: hide console for spawned child processes.
+# When ZubriTunnel runs from a PyInstaller --windowed .exe, the parent has
+# no console, and every child via subprocess.Popen by default gets a fresh
+# console window flashing on screen. CREATE_NO_WINDOW (0x08000000) suppresses it.
+WIN_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
+
+
+def _win_subprocess_kwargs(extra_flags: int = 0) -> dict:
+    """Return kwargs for subprocess.Popen/run that hide the console window
+    on Windows. Returns empty dict on other platforms."""
+    if os.name != "nt":
+        return {}
+    return {"creationflags": WIN_NO_WINDOW | extra_flags}
 
 
 def proxy_env(proxy_url: str) -> dict:
@@ -1673,9 +1688,9 @@ class App(tk.Tk):
         if IS_WIN:
             os.startfile(str(KEYS_DIR))  # type: ignore[attr-defined]
         elif IS_MAC:
-            subprocess.Popen(["open", str(KEYS_DIR)])
+            subprocess.Popen(["open", str(KEYS_DIR)], **_win_subprocess_kwargs())
         else:
-            subprocess.Popen(["xdg-open", str(KEYS_DIR)])
+            subprocess.Popen(["xdg-open", str(KEYS_DIR)], **_win_subprocess_kwargs())
 
     # ---- proxy control ----
 
@@ -1726,7 +1741,11 @@ class App(tk.Tk):
                 errors="replace",
             )
             if IS_WIN:
-                popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
+                # CREATE_NEW_PROCESS_GROUP: needed to send Ctrl+Break for clean shutdown
+                # CREATE_NO_WINDOW: suppress the flashing console window on launch
+                popen_kwargs["creationflags"] = (
+                    subprocess.CREATE_NEW_PROCESS_GROUP | WIN_NO_WINDOW  # type: ignore[attr-defined]
+                )
             proc = subprocess.Popen(cmd, **popen_kwargs)
             # Bind to job so vpn-proxy is killed when ZubriTunnel exits, even on hard crash
             if IS_WIN:
@@ -2165,14 +2184,14 @@ class App(tk.Tk):
                     return
                 proxy = f"http://{active['addr']}"
                 subprocess.run(["git", "config", "--global", "http.proxy", proxy],
-                               env=enhanced_path_env(), check=True)
+                               env=enhanced_path_env(, **_win_subprocess_kwargs()), check=True)
                 subprocess.run(["git", "config", "--global", "https.proxy", proxy],
-                               env=enhanced_path_env(), check=True)
+                               env=enhanced_path_env(, **_win_subprocess_kwargs()), check=True)
                 self.log_msg(f"git: http.proxy={proxy} (global)")
                 messagebox.showinfo("git", f"Все git-команды теперь через {proxy}.\nНе забудь выключить, когда наскучит.")
             else:
-                subprocess.run(["git", "config", "--global", "--unset", "http.proxy"], env=enhanced_path_env())
-                subprocess.run(["git", "config", "--global", "--unset", "https.proxy"], env=enhanced_path_env())
+                subprocess.run(["git", "config", "--global", "--unset", "http.proxy"], env=enhanced_path_env(, **_win_subprocess_kwargs()))
+                subprocess.run(["git", "config", "--global", "--unset", "https.proxy"], env=enhanced_path_env(, **_win_subprocess_kwargs()))
                 self.log_msg("git: proxy unset")
                 messagebox.showinfo("git", "git proxy выключен.")
         except FileNotFoundError:
@@ -2450,7 +2469,7 @@ class App(tk.Tk):
         try:
             go = find_go_binary() or "go"
             r = subprocess.run([go, "build", "-o", out, "."],
-                               cwd=workdir, env=enhanced_path_env(),
+                               cwd=workdir, env=enhanced_path_env(, **_win_subprocess_kwargs()),
                                capture_output=True, text=True, timeout=180)
             if r.returncode == 0:
                 self.log_msg(f"vpn-proxy собран: {out}")
@@ -2490,11 +2509,11 @@ class App(tk.Tk):
             # Экранируем кавычки для AppleScript
             esc = command.replace('\\', '\\\\').replace('"', '\\"')
             script = f'tell application "Terminal" to do script "{esc}"\ntell application "Terminal" to activate'
-            subprocess.Popen(["osascript", "-e", script])
+            subprocess.Popen(["osascript", "-e", script], **_win_subprocess_kwargs())
         elif IS_WIN:
-            subprocess.Popen(["cmd.exe", "/k", command])
+            subprocess.Popen(["cmd.exe", "/k", command], **_win_subprocess_kwargs())
         else:
-            subprocess.Popen(["x-terminal-emulator", "-e", command])
+            subprocess.Popen(["x-terminal-emulator", "-e", command], **_win_subprocess_kwargs())
         self.log_msg(f"открыл терминал: {command}")
 
     def open_log_window(self):
