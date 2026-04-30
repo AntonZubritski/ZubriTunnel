@@ -139,13 +139,18 @@ jobs:
           echo "$TAG" > VERSION
           # Mirror VERSION into the .app's Resources so the GUI can find it
           cp VERSION mac/ZubriTunnel.app/Contents/Resources/VERSION
-          # Bump CFBundleShortVersionString and CFBundleVersion in Info.plist
-          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $TAG" \
-            mac/ZubriTunnel.app/Contents/Info.plist
-          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $TAG" \
-            mac/ZubriTunnel.app/Contents/Info.plist
+          # Bump version EVERYWHERE macOS shows it:
+          #   - CFBundleShortVersionString → Get Info / About
+          #   - CFBundleVersion            → internal build version
+          #   - CFBundleDisplayName        → name in Dock + menu bar (top of screen)
+          #   - CFBundleName               → name in app switcher (Cmd+Tab)
+          PLIST=mac/ZubriTunnel.app/Contents/Info.plist
+          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $TAG" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $TAG" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName ZubriTunnel v$TAG" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleName ZubriTunnel v$TAG" "$PLIST"
           echo "stamped version: $TAG"
-          cat mac/ZubriTunnel.app/Contents/Info.plist | head -30
+          cat "$PLIST"
 
       - name: Build universal vpn-proxy (arm64 native + x86_64 cross with CGO)
         run: |
