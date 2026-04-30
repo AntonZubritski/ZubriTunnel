@@ -130,6 +130,14 @@ jobs:
           go-version: '1.22'
           cache-dependency-path: mac/ZubriTunnel.app/Contents/Resources/go.sum
 
+      - name: Sync gui.py from windows/ (single source of truth)
+        run: |
+          # CRITICAL: mac/ZubriTunnel.app/Contents/Resources/gui.py used to be a
+          # divergent copy. Force it identical to windows/gui.py before every
+          # build so changes can't drift between platforms.
+          cp windows/gui.py mac/ZubriTunnel.app/Contents/Resources/gui.py
+          shasum windows/gui.py mac/ZubriTunnel.app/Contents/Resources/gui.py
+
       - name: Stamp VERSION + Info.plist with tag
         run: |
           # Resolve TAG. github.ref_name is "v1.0.X" for tag pushes;

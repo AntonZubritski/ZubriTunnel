@@ -211,6 +211,26 @@ def check_dependencies() -> list:
             "fix_action": "install_brew" if not brew else None,
         })
 
+    # OpenVPN (нужен только для .ovpn ключей, поэтому detail объясняет это)
+    ovpn = find_openvpn_binary()
+    if ovpn:
+        # Различаем bundled внутри .app/Frameworks vs system install
+        is_bundled = (
+            "Frameworks/openvpn" in ovpn.replace("\\", "/")
+            or "windows/openvpn" in ovpn.replace("\\", "/")
+            or "windows\\openvpn" in ovpn
+        )
+        detail = f"{ovpn}  (встроен в ZubriTunnel)" if is_bundled else ovpn
+    else:
+        detail = "не найден — нужен для подключения .ovpn ключей. Нажми «Установить»."
+    deps.append({
+        "name": "OpenVPN",
+        "ok": ovpn is not None,
+        "detail": detail,
+        "fix_label": "Установить" if not ovpn else None,
+        "fix_action": "install_openvpn" if not ovpn else None,
+    })
+
     return deps
 
 
@@ -777,6 +797,50 @@ class RoundedCard(tk.Frame):
 APP_NAME = "ZubriTunnel"
 SETTINGS_FILE = SCRIPT_DIR / "settings.json"
 
+
+def read_app_version() -> str:
+    """Get app version. Tries multiple sources, in priority order:
+       1. macOS: CFBundleShortVersionString from Info.plist (most reliable —
+          CI's PlistBuddy step always bumps it; the .pkg always carries it)
+       2. VERSION text file next to gui.py / inside PyInstaller bundle
+       3. fallback "dev"
+    """
+    # Mac: read Info.plist directly — that's the canonical version macOS uses
+    if sys.platform == "darwin":
+        for plist in (
+            SCRIPT_DIR.parent / "Info.plist",        # ../Resources/.. → Info.plist
+            SCRIPT_DIR.parent.parent / "Info.plist", # safety
+        ):
+            try:
+                if plist.is_file():
+                    import plistlib
+                    with open(plist, "rb") as f:
+                        data = plistlib.load(f)
+                    v = (data.get("CFBundleShortVersionString") or "").strip()
+                    if v and v != "1.0":  # "1.0" = un-stamped default in repo
+                        return v
+            except Exception:
+                pass
+    # Cross-platform: VERSION text file
+    for cand in (
+        BUNDLE_DIR / "VERSION",
+        SCRIPT_DIR / "VERSION",
+        SCRIPT_DIR.parent / "VERSION",
+        BUNDLE_DIR.parent / "VERSION",
+        BUNDLE_DIR.parent / "Resources" / "VERSION",
+    ):
+        try:
+            if cand.is_file():
+                v = cand.read_text(encoding="utf-8").strip()
+                if v:
+                    return v
+        except Exception:
+            pass
+    return "dev"
+
+
+APP_VERSION = read_app_version()
+
 DARK_COLORS = {
     "bg":       "#161616",
     "panel":    "#1E1E1E",
@@ -1061,7 +1125,7 @@ def apply_theme(root: tk.Tk, mode: str = "system"):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title(APP_NAME)
+        self.title(f"{APP_NAME} v{APP_VERSION}")
         # Compute DPI scale and resize fonts/window accordingly
         self._dpi_scale = self._detect_dpi_scale()
         try:
@@ -1093,6 +1157,28 @@ class App(tk.Tk):
         self.after(50, lambda: apply_dark_titlebar(self, self.actual_theme == "dark"))
         # Shrink window to content's natural height (no big empty space below)
         self.after(80, self._fit_window_to_content)
+        # When the user closes the window, kill running proxies + clean utuns
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        # Track utun device names that OUR openvpn allocates — used so the
+        # disconnect-time cleanup only destroys interfaces we actually created.
+        # Maps proxy-name -> "utunN". NEVER touch utuns we didn't put here.
+        self._our_utuns: dict[str, str] = {}
+
+    def _on_close(self):
+        """Window-close handler: stop all proxies (incl. ovpn cleanup), then exit."""
+        try:
+            for name, p in list(self.proxies.items()):
+                try:
+                    if p.get("type") == "ovpn":
+                        self._stop_ovpn(p)
+                    else:
+                        proc = p.get("proc")
+                        if proc and proc.poll() is None:
+                            proc.terminate()
+                except Exception:
+                    pass
+        finally:
+            self.destroy()
 
     def _fit_window_to_content(self):
         try:
@@ -1231,6 +1317,8 @@ class App(tk.Tk):
         head.pack(fill="x", pady=(0, 14))
         tk.Label(head, text=APP_NAME, bg=COLORS["bg"], fg=COLORS["text"],
                  font=UI_FONT_TITLE).pack(side="left")
+        tk.Label(head, text=f"v{APP_VERSION}", bg=COLORS["bg"],
+                 fg=COLORS["muted"], font=UI_FONT).pack(side="left", padx=(8, 0))
         tk.Label(head, text="• точечный VPN для приложений", bg=COLORS["bg"],
                  fg=COLORS["muted"], font=UI_FONT).pack(side="left", padx=8)
         self.theme_var = tk.StringVar(value=self.theme_mode)
@@ -1931,13 +2019,17 @@ class App(tk.Tk):
             return
         ovpn_bin = find_openvpn_binary()
         if not ovpn_bin:
-            messagebox.showerror(
-                "OpenVPN не установлен",
-                "Поставь OpenVPN-клиент:\n\n"
-                "  • Mac:  brew install openvpn  (или скачай Tunnelblick)\n"
-                "  • Win:  https://openvpn.net/community-downloads/\n\n"
-                "После установки попробуй ещё раз."
+            # Открываем "Системные зависимости" — там ровно строка OpenVPN
+            # с кнопкой «Установить», вместо тупикового messagebox.
+            self.log_msg(
+                f"{k['name']}: OpenVPN не найден — открываю «Системные зависимости»"
             )
+            messagebox.showinfo(
+                "Нужен OpenVPN",
+                "Для .ovpn ключей нужен openvpn-клиент. "
+                "Сейчас открою «Системные зависимости» — там нажми «Установить» рядом с OpenVPN."
+            )
+            self.show_deps_dialog()
             return
 
         # Write the ovpn config to a temp file so we can pass --config <path>
@@ -1966,15 +2058,22 @@ class App(tk.Tk):
         threading.Thread(target=self._wait_ovpn_ready, args=(k, log_path), daemon=True).start()
 
     def _spawn_ovpn(self, ovpn_bin: str, cfg_path: str, log_path: str):
-        """Запустить openvpn с elevation. Возвращает Popen-подобный объект (на Windows
-        это launcher-процесс PowerShell; на Mac — sh с osascript). Реальный openvpn
-        работает как root."""
+        """Запустить openvpn с elevation. На Windows — UAC через PowerShell.
+        На macOS — пароль через osascript. Реальный openvpn работает как root."""
+        # Pre-create log file with user-permissions so we (non-root) can read it
+        # even when openvpn (root) appends to it. Without this, root creates the
+        # file with mode 0640 root:wheel and our log-watcher thread can't read.
+        try:
+            Path(log_path).write_text("")  # empty file, owner=user, mode=user umask
+            os.chmod(log_path, 0o666)
+        except Exception:
+            pass
+
         cfg_dir = os.path.dirname(cfg_path)
         if IS_WIN:
-            # PowerShell Start-Process -Verb RunAs показывает UAC prompt
             ps = (
                 f'$p = Start-Process -FilePath \'{ovpn_bin}\' '
-                f'-ArgumentList \'--config\',\'{cfg_path}\',\'--log\',\'{log_path}\' '
+                f'-ArgumentList \'--config\',\'{cfg_path}\',\'--log-append\',\'{log_path}\' '
                 f'-WorkingDirectory \'{cfg_dir}\' -Verb RunAs -PassThru -WindowStyle Hidden; '
                 f'$p.Id'
             )
@@ -1989,16 +2088,32 @@ class App(tk.Tk):
                 messagebox.showerror("Ошибка запуска OpenVPN", str(e))
                 return None
         elif IS_MAC:
-            # osascript with administrator privileges запросит пароль через native dialog
-            cmd = f"{shlex.quote(ovpn_bin)} --config {shlex.quote(cfg_path)} --log {shlex.quote(log_path)} --daemon"
-            applescript = (
-                f'do shell script "{cmd}" '
-                f'with administrator privileges '
-                f'with prompt "ZubriTunnel хочет запустить OpenVPN — нужен пароль администратора"'
+            # Foreground (no --daemon) so:
+            #  - osascript stays alive while openvpn runs, our Popen handle stays alive
+            #  - poll() detects when openvpn dies on its own (e.g. Gatekeeper block)
+            #  - --log-append uses our pre-created world-readable file
+            #
+            # AppleScript wrapping:
+            #  - 'with timeout of 86400 seconds' otherwise do-shell-script aborts at 120s
+            #  - 2>&1 redirects openvpn stderr into the same log so we see startup errors
+            cmd = (
+                f"{shlex.quote(ovpn_bin)} "
+                f"--config {shlex.quote(cfg_path)} "
+                f"--log-append {shlex.quote(log_path)} "
+                f">> {shlex.quote(log_path)} 2>&1"
             )
             try:
                 proc = subprocess.Popen(
-                    ["osascript", "-e", applescript],
+                    [
+                        "osascript",
+                        "-e", "with timeout of 86400 seconds",
+                        "-e", (
+                            f'do shell script "{cmd}" '
+                            f'with administrator privileges '
+                            f'with prompt "ZubriTunnel хочет запустить OpenVPN — нужен пароль администратора"'
+                        ),
+                        "-e", "end timeout",
+                    ],
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                 )
                 return proc
@@ -2010,29 +2125,112 @@ class App(tk.Tk):
             return None
 
     def _wait_ovpn_ready(self, k: dict, log_path: str):
-        """Парсим лог OpenVPN до 'Initialization Sequence Completed' = коннект готов."""
+        """Парсим лог OpenVPN до 'Initialization Sequence Completed' = коннект готов.
+        Также периодически логируем последние строки в наш лог чтобы юзер видел прогресс."""
         import time as _t
-        deadline = _t.time() + 30
+        deadline = _t.time() + 60  # generous timeout
+        last_log_size = 0
+        last_emit = 0
+        proxy_entry = self.proxies.get(k["name"], {})
+        proc = proxy_entry.get("proc")
         while _t.time() < deadline:
+            # If the elevation wrapper (osascript / powershell) died, OpenVPN
+            # never started or exited. Surface that quickly instead of waiting 60s.
+            if proc is not None and proc.poll() is not None:
+                rc = proc.returncode
+                stderr = ""
+                try:
+                    stderr = (proc.stderr.read() or "").strip()
+                except Exception:
+                    pass
+                tail = ""
+                try:
+                    tail = "\n".join(
+                        Path(log_path).read_text(encoding="utf-8", errors="replace")
+                        .splitlines()[-15:]
+                    )
+                except Exception:
+                    pass
+                if rc != 0 and "User cancel" in stderr:
+                    self.log_msg(f"{k['name']}: пароль не введён, отмена")
+                else:
+                    msg_parts = [f"OpenVPN не запустился (код {rc})."]
+                    if stderr: msg_parts.append(f"\nstderr:\n{stderr}")
+                    if tail:   msg_parts.append(f"\nlog:\n{tail}")
+                    if not stderr and not tail:
+                        msg_parts.append(
+                            "\nЛог пустой — возможно binary заблокирован Gatekeeper.\n"
+                            "Попробуй: xattr -dr com.apple.quarantine /Applications/ZubriTunnel.app"
+                        )
+                    full = "\n".join(msg_parts)
+                    self.log_msg(f"{k['name']}: {full}")
+                    self.after(0, lambda m=full: messagebox.showerror("OpenVPN — сбой", m))
+                # Cleanup ghost proxy entry
+                self.proxies.pop(k["name"], None)
+                self.after(0, lambda: (self._update_status_display(), self.refresh_keys()))
+                # Failed openvpn might have allocated a utun before crashing.
+                # If we managed to capture its name from the log, destroy ONLY
+                # that one (never blanket-destroy utuns — they're shared with
+                # iCloud Private Relay / Continuity / system VPN).
+                our_utun = self._our_utuns.pop(k["name"], None)
+                if IS_MAC and our_utun:
+                    self.after(0, lambda u=our_utun: self._mac_run_cleanup(
+                        prompt="OpenVPN упал — ZubriTunnel сносит свой utun",
+                        kill_openvpn=True,
+                        destroy_utuns=[u],
+                    ))
+                return
             try:
                 if os.path.exists(log_path):
-                    text = Path(log_path).read_text(encoding="utf-8", errors="replace")
-                    if "Initialization Sequence Completed" in text:
-                        self.after(0, lambda: (
-                            self.log_msg(f"{k['name']}: VPN tunnel up — system-wide"),
-                            self._update_status_display(),
-                            self.refresh_keys(),
-                        ))
-                        return
-                    if "AUTH_FAILED" in text or "Cannot allocate TUN" in text:
-                        snippet = "\n".join(text.splitlines()[-10:])
-                        self.after(0, lambda s=snippet: messagebox.showerror(
-                            "OpenVPN ошибка", f"Сбой подключения:\n\n{s}"))
-                        return
+                    size = os.path.getsize(log_path)
+                    if size > last_log_size:
+                        # New content — log a few interesting lines
+                        text = Path(log_path).read_text(encoding="utf-8", errors="replace")
+                        last_log_size = size
+                        # Emit last interesting line every 3 sec
+                        if _t.time() - last_emit > 3:
+                            for line in text.splitlines()[-3:]:
+                                if line.strip():
+                                    self.log_msg(f"{k['name']}: {line.strip()}")
+                            last_emit = _t.time()
+                        # Capture which utun OpenVPN allocated — needed for
+                        # cleanup so we destroy ONLY our interface, never
+                        # iCloud / Continuity / system utuns.
+                        if k["name"] not in self._our_utuns:
+                            import re as _re
+                            m = _re.search(r"\b(utun\d+)\b", text)
+                            if m:
+                                self._our_utuns[k["name"]] = m.group(1)
+                                self.log_msg(f"{k['name']}: TUN device = {m.group(1)}")
+                        if "Initialization Sequence Completed" in text:
+                            self.after(0, lambda: (
+                                self.log_msg(f"{k['name']}: ✓ VPN tunnel up — system-wide"),
+                                self._update_status_display(),
+                                self.refresh_keys(),
+                            ))
+                            return
+                        if "AUTH_FAILED" in text:
+                            self.after(0, lambda: messagebox.showerror(
+                                "OpenVPN: auth failed",
+                                "Сервер отклонил аутентификацию. Проверь логин/пароль или сертификат в .ovpn."))
+                            return
+                        if "Cannot allocate TUN" in text or "TUN_ERROR" in text:
+                            self.after(0, lambda: messagebox.showerror(
+                                "OpenVPN: TUN error",
+                                "Не получилось создать сетевой интерфейс. Проверь что нет конфликтующих VPN-клиентов."))
+                            return
             except Exception:
                 pass
             _t.sleep(1.0)
-        self.log_msg(f"{k['name']}: timed out waiting for VPN tunnel — see {log_path}")
+        self.log_msg(f"{k['name']}: timeout 60s — see {log_path}")
+        # Emit tail of log so user sees what was happening
+        try:
+            text = Path(log_path).read_text(encoding="utf-8", errors="replace")
+            for line in text.splitlines()[-15:]:
+                if line.strip():
+                    self.log_msg(f"  {line.strip()}")
+        except Exception:
+            pass
 
     def _wait_listening(self, proc: subprocess.Popen, k: dict, addr: str):
         marker = f"listening on http://{addr}"
@@ -2137,12 +2335,17 @@ class App(tk.Tk):
         self.refresh_keys()
 
     def _stop_ovpn(self, p: dict):
-        """Kill the elevated openvpn process and clean up tmp files."""
+        """Kill the elevated openvpn process AND clean up everything it left
+        behind (stale utun interfaces + IPv6 default routes pointing through
+        them) — otherwise multiple failed connect attempts pile up dead utuns
+        that hijack the system's default route and break internet.
+
+        On Mac one elevated osascript prompt covers kill + route flush + utun
+        destroy. On Windows the OpenVPN community client cleans up its own
+        TAP/Wintun interface, so just taskkill is enough."""
         cfg_path = p.get("config_path")
         log_path = p.get("log_path")
         if IS_WIN:
-            # taskkill needs admin to kill an elevated process. Run via PowerShell
-            # Start-Process -Verb RunAs which shows a single UAC prompt.
             try:
                 ps = (
                     "Start-Process -FilePath 'taskkill' "
@@ -2157,17 +2360,19 @@ class App(tk.Tk):
             except Exception as e:
                 self.log_msg(f"не удалось остановить OpenVPN: {e}")
         elif IS_MAC:
-            # Use osascript with administrator privileges to run pkill
-            try:
-                applescript = (
-                    'do shell script "pkill -SIGTERM openvpn || true" '
-                    'with administrator privileges '
-                    'with prompt "ZubriTunnel хочет остановить OpenVPN"'
-                )
-                subprocess.run(["osascript", "-e", applescript], timeout=15)
-                self.log_msg("OpenVPN остановлен (pkill, sudo)")
-            except Exception as e:
-                self.log_msg(f"не удалось остановить OpenVPN: {e}")
+            # Find the proxy entry to grab the utun we recorded for it.
+            # If openvpn never reported its utun (early crash), destroy_utuns is [],
+            # which means osascript will only pkill — safe.
+            our_utun = None
+            for name, entry in list(self.proxies.items()):
+                if entry is p:
+                    our_utun = self._our_utuns.pop(name, None)
+                    break
+            self._mac_run_cleanup(
+                prompt="ZubriTunnel останавливает OpenVPN",
+                kill_openvpn=True,
+                destroy_utuns=[our_utun] if our_utun else [],
+            )
 
         # Clean up temp config and log
         for path in (cfg_path, log_path):
@@ -2176,6 +2381,73 @@ class App(tk.Tk):
                     os.unlink(path)
                 except OSError:
                     pass
+
+    def _mac_run_cleanup(self, prompt: str, kill_openvpn: bool = True,
+                         destroy_utuns: list[str] | None = None) -> bool:
+        """Run elevated cleanup via a single osascript admin prompt.
+
+        SAFETY: never destroys utun interfaces we didn't allocate ourselves —
+        utun devices on macOS are also used by iCloud Private Relay, AirDrop,
+        Wi-Fi Calling, system VPN. Blindly destroying them can hard-lock the OS.
+        Caller MUST pass an explicit list of utun names that we KNOW our
+        openvpn created (parsed from openvpn's log). Empty list = skip destroy.
+        """
+        if not IS_MAC:
+            return False
+        destroy_utuns = destroy_utuns or []
+
+        lines: list[str] = []
+        if kill_openvpn:
+            lines.append("pkill -SIGTERM openvpn 2>/dev/null || true")
+            lines.append("sleep 1")
+            lines.append("pkill -KILL openvpn 2>/dev/null || true")
+        for u in destroy_utuns:
+            # Only destroy interfaces named utunN — extra safety belt against
+            # accidentally passing en0 or something else that would break Wi-Fi.
+            if u.startswith("utun") and u[4:].isdigit():
+                lines.append(f"ifconfig {u} destroy 2>/dev/null || true")
+        if not lines:
+            return True
+        lines.append("exit 0")
+        script = "#!/bin/bash\n" + "\n".join(lines) + "\n"
+
+        import tempfile
+        f = tempfile.NamedTemporaryFile(
+            "w", suffix=".sh", delete=False,
+            prefix="zubri-cleanup-", encoding="utf-8",
+        )
+        f.write(script)
+        f.close()
+        os.chmod(f.name, 0o755)
+        applescript = (
+            f'do shell script "/bin/bash {shlex.quote(f.name)}" '
+            f'with administrator privileges '
+            f'with prompt "{prompt}"'
+        )
+        try:
+            r = subprocess.run(
+                ["osascript", "-e", applescript],
+                capture_output=True, text=True, timeout=30,
+            )
+            if r.returncode == 0:
+                if destroy_utuns:
+                    self.log_msg(f"✓ снесены наши utun: {', '.join(destroy_utuns)}")
+                if kill_openvpn:
+                    self.log_msg("✓ OpenVPN остановлен")
+                return True
+            else:
+                err = (r.stderr or "").strip()
+                if "User canceled" in err or "User cancel" in err:
+                    self.log_msg("очистка отменена пользователем")
+                else:
+                    self.log_msg(f"очистка упала: {err or 'rc=' + str(r.returncode)}")
+                return False
+        except Exception as e:
+            self.log_msg(f"очистка упала: {e}")
+            return False
+        finally:
+            try: os.unlink(f.name)
+            except OSError: pass
 
     def _poll_procs(self):
         died = [name for name, p in self.proxies.items() if p["proc"].poll() is not None]
@@ -2741,6 +3013,8 @@ class App(tk.Tk):
             self._install_go()
         elif action == "install_brew":
             self._install_brew()
+        elif action == "install_openvpn":
+            self._install_openvpn()
         if parent_win is not None:
             try:
                 parent_win.destroy()
@@ -2806,6 +3080,26 @@ class App(tk.Tk):
             return
         cmd = '/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"'
         self._open_terminal_install(cmd)
+
+    def _install_openvpn(self):
+        if IS_MAC:
+            brew = shutil.which("brew") or "/opt/homebrew/bin/brew"
+            if os.path.exists(brew):
+                arch_prefix = "arch -arm64 " if "/opt/homebrew" in brew else ""
+                self._open_terminal_install(f"{arch_prefix}{brew} install openvpn")
+            else:
+                messagebox.showinfo("Сначала Homebrew",
+                    "Сначала установи Homebrew (есть кнопка в «проверке системы»),\n"
+                    "потом обнови проверку и нажми «Установить» рядом с OpenVPN.\n\n"
+                    "Альтернатива: скачай Tunnelblick — https://tunnelblick.net")
+        elif IS_WIN:
+            import webbrowser
+            webbrowser.open("https://openvpn.net/community-downloads/")
+            messagebox.showinfo("Скачай OpenVPN",
+                "Открыл https://openvpn.net/community-downloads/ — скачай OpenVPN MSI и поставь.\n\n"
+                "После установки перезапусти ZubriTunnel — бинарник найдётся автоматически.")
+        else:
+            self._open_terminal_install("sudo apt-get install -y openvpn || sudo dnf install -y openvpn")
 
     def _open_terminal_install(self, command: str):
         """Открыть Terminal/cmd с командой установки."""
@@ -3075,11 +3369,11 @@ def setup_macos_app_name(name: str = "ZubriTunnel"):
 def main():
     setup_windows_dpi()
     setup_windows_taskbar_id()
-    setup_macos_app_name("ZubriTunnel")
+    setup_macos_app_name(f"ZubriTunnel v{APP_VERSION}")
     KEYS_DIR.mkdir(exist_ok=True)
     app = App()
     try:
-        app.tk.call("tk", "appname", "ZubriTunnel")
+        app.tk.call("tk", "appname", f"ZubriTunnel v{APP_VERSION}")
     except Exception:
         pass
     # Register atexit so even hard crashes / Ctrl-C cleanup
