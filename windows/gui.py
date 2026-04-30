@@ -2447,32 +2447,49 @@ def setup_windows_taskbar_id():
 def setup_macos_app_name(name: str = "ZubriTunnel"):
     """Override macOS process / menu-bar / dock display name from 'Python' to
     our app name. Uses libobjc (no PyObjC dep needed). Best-effort — silently
-    skips if any objc call fails (e.g. on non-Apple Python builds)."""
+    skips if any objc call fails."""
     if sys.platform != "darwin":
         return
     try:
         import ctypes
         import ctypes.util
 
-        objc = ctypes.cdll.LoadLibrary(ctypes.util.find_library("objc"))
-        # Foundation framework gives us NSBundle / NSString
-        ctypes.cdll.LoadLibrary("/System/Library/Frameworks/Foundation.framework/Foundation")
+        c_void_p = ctypes.c_void_p
+        c_char_p = ctypes.c_char_p
 
-        objc.objc_getClass.restype = ctypes.c_void_p
-        objc.objc_getClass.argtypes = [ctypes.c_char_p]
-        objc.sel_registerName.restype = ctypes.c_void_p
-        objc.sel_registerName.argtypes = [ctypes.c_char_p]
+        objc_path = ctypes.util.find_library("objc")
+        if not objc_path:
+            return
+        objc = ctypes.cdll.LoadLibrary(objc_path)
+        # Foundation framework registers NSBundle / NSString classes
+        try:
+            ctypes.cdll.LoadLibrary("/System/Library/Frameworks/Foundation.framework/Foundation")
+        except OSError:
+            return
 
-        # objc_msgSend has no fixed signature — we wrap it via cast for each call shape
-        msgSend_addr = ctypes.addressof(objc.objc_msgSend)
-        proto_obj_no_args = ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p)
-        proto_obj_str = ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_char_p)
-        proto_obj_2obj = ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p)
-        msg = proto_obj_no_args(msgSend_addr)
-        msg_str = proto_obj_str(msgSend_addr)
-        msg_2obj = proto_obj_2obj(msgSend_addr)
+        objc.objc_getClass.restype = c_void_p
+        objc.objc_getClass.argtypes = [c_char_p]
+        objc.sel_registerName.restype = c_void_p
+        objc.sel_registerName.argtypes = [c_char_p]
+
+        # IMPORTANT: get the actual address of the C function via cast, not
+        # ctypes.addressof — addressof returns the address of the Python
+        # ctypes wrapper struct, not the function itself, and jumping there
+        # causes EXC_BAD_ACCESS / bus error.
+        msg_addr = ctypes.cast(objc.objc_msgSend, c_void_p).value
+        if not msg_addr:
+            return
+
+        FN_obj = ctypes.CFUNCTYPE(c_void_p, c_void_p, c_void_p)
+        FN_str = ctypes.CFUNCTYPE(c_void_p, c_void_p, c_void_p, c_char_p)
+        FN_2obj = ctypes.CFUNCTYPE(c_void_p, c_void_p, c_void_p, c_void_p, c_void_p)
+        msg = FN_obj(msg_addr)
+        msg_str = FN_str(msg_addr)
+        msg_2obj = FN_2obj(msg_addr)
 
         NSBundle = objc.objc_getClass(b"NSBundle")
+        if not NSBundle:
+            return
         bundle = msg(NSBundle, objc.sel_registerName(b"mainBundle"))
         if not bundle:
             return
@@ -2483,6 +2500,8 @@ def setup_macos_app_name(name: str = "ZubriTunnel"):
             return
 
         NSString = objc.objc_getClass(b"NSString")
+        if not NSString:
+            return
         sel_string = objc.sel_registerName(b"stringWithUTF8String:")
         ns_name = msg_str(NSString, sel_string, name.encode("utf-8"))
         ns_key = msg_str(NSString, sel_string, b"CFBundleName")
@@ -2491,7 +2510,7 @@ def setup_macos_app_name(name: str = "ZubriTunnel"):
 
         msg_2obj(info, objc.sel_registerName(b"setValue:forKey:"), ns_name, ns_key)
     except Exception:
-        pass
+        pass  # never crash the app for a cosmetic name fix
 
 
 def main():
