@@ -2092,26 +2092,74 @@ class App(tk.Tk):
         p = self.proxies.pop(key_name, None)
         if not p:
             return
-        proc = p["proc"]
-        if proc.poll() is None:
-            try:
-                if IS_WIN:
-                    proc.send_signal(signal.CTRL_BREAK_EVENT)  # type: ignore[attr-defined]
-                else:
-                    proc.send_signal(signal.SIGINT)
-            except (OSError, ValueError):
-                pass
-            try:
-                proc.wait(timeout=3)
-            except subprocess.TimeoutExpired:
+
+        # OpenVPN: elevated process. Our Popen handle is the launcher (PowerShell
+        # / osascript), not openvpn itself. Need to kill openvpn separately
+        # via elevated taskkill/sudo.
+        if (p.get("type") or "").lower() == "ovpn":
+            self._stop_ovpn(p)
+        else:
+            proc = p["proc"]
+            if proc.poll() is None:
                 try:
-                    proc.terminate()
-                    proc.wait(timeout=2)
+                    if IS_WIN:
+                        proc.send_signal(signal.CTRL_BREAK_EVENT)  # type: ignore[attr-defined]
+                    else:
+                        proc.send_signal(signal.SIGINT)
+                except (OSError, ValueError):
+                    pass
+                try:
+                    proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    try:
+                        proc.terminate()
+                        proc.wait(timeout=2)
+                    except Exception:
+                        pass
                 except Exception:
                     pass
-            except Exception:
-                pass
         self.refresh_keys()
+
+    def _stop_ovpn(self, p: dict):
+        """Kill the elevated openvpn process and clean up tmp files."""
+        cfg_path = p.get("config_path")
+        log_path = p.get("log_path")
+        if IS_WIN:
+            # taskkill needs admin to kill an elevated process. Run via PowerShell
+            # Start-Process -Verb RunAs which shows a single UAC prompt.
+            try:
+                ps = (
+                    "Start-Process -FilePath 'taskkill' "
+                    "-ArgumentList '/IM','openvpn.exe','/F' "
+                    "-Verb RunAs -WindowStyle Hidden -Wait"
+                )
+                subprocess.run(
+                    ["powershell", "-NoProfile", "-Command", ps],
+                    timeout=15, **_win_subprocess_kwargs(),
+                )
+                self.log_msg("OpenVPN остановлен (taskkill, UAC)")
+            except Exception as e:
+                self.log_msg(f"не удалось остановить OpenVPN: {e}")
+        elif IS_MAC:
+            # Use osascript with administrator privileges to run pkill
+            try:
+                applescript = (
+                    'do shell script "pkill -SIGTERM openvpn || true" '
+                    'with administrator privileges '
+                    'with prompt "ZubriTunnel хочет остановить OpenVPN"'
+                )
+                subprocess.run(["osascript", "-e", applescript], timeout=15)
+                self.log_msg("OpenVPN остановлен (pkill, sudo)")
+            except Exception as e:
+                self.log_msg(f"не удалось остановить OpenVPN: {e}")
+
+        # Clean up temp config and log
+        for path in (cfg_path, log_path):
+            if path:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
 
     def _poll_procs(self):
         died = [name for name, p in self.proxies.items() if p["proc"].poll() is not None]
