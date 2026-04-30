@@ -1022,6 +1022,18 @@ class App(tk.Tk):
         s = getattr(self, "_dpi_scale", 1.0)
         return f"{int(w * s)}x{int(h * s)}"
 
+    def _style_toplevel(self, win):
+        """Apply dark/light theme + dark title bar to a Toplevel popup.
+        Without this Tkinter creates Toplevels with the system default
+        (usually light gray) bg, and DwmSetWindowAttribute is never called
+        for the popup's title bar — leaves a white bar on top of dark body."""
+        try:
+            win.configure(bg=COLORS["bg"])
+        except Exception:
+            pass
+        win.after(50, lambda: apply_dark_titlebar(
+            win, getattr(self, "actual_theme", "dark") == "dark"))
+
     def _detect_dpi_scale(self) -> float:
         """Return DPI scale factor (1.0 = 96 DPI = 100%)."""
         if os.name == "nt":
@@ -1335,6 +1347,7 @@ class App(tk.Tk):
         win.transient(self)
         win.grab_set()
         win.geometry(self._scaled_geom(520, 180))
+        self._style_toplevel(win)
         win.resizable(True, False)
 
         ttk.Label(win, text=prompt, justify="left", wraplength=480).pack(fill="x", padx=12, pady=(12, 6))
@@ -1377,6 +1390,7 @@ class App(tk.Tk):
         win = tk.Toplevel(self)
         win.title("Вставь JSON ключа")
         win.geometry(self._scaled_geom(520, 320))
+        self._style_toplevel(win)
         txt = scrolledtext.ScrolledText(win, font=("Courier", 9))
         txt.pack(fill="both", expand=True, padx=8, pady=8)
         txt.insert("1.0", '{\n  "method": "chacha20-ietf-poly1305",\n  "password": "...",\n  "server": "1.2.3.4",\n  "server_port": 443,\n  "tag": "Country"\n}\n')
@@ -1439,6 +1453,7 @@ class App(tk.Tk):
         win = tk.Toplevel(self)
         win.title(f"Приложения через «{k['name']}»")
         win.geometry(self._scaled_geom(560, 360))
+        self._style_toplevel(win)
         win.transient(self)
         apply_theme(win)
         win.configure(bg=COLORS["bg"])
@@ -1560,6 +1575,7 @@ class App(tk.Tk):
         win = tk.Toplevel(self)
         win.title(f"Сменить регион — {k['name']}")
         win.geometry(self._scaled_geom(520, 420))
+        self._style_toplevel(win)
         win.transient(self)
 
         ttk.Label(win, text=f"Текущий регион: {k['tag']}", anchor="w").pack(fill="x", padx=10, pady=(10, 4))
