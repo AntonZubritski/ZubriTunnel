@@ -1157,36 +1157,12 @@ class App(tk.Tk):
         self.after(50, lambda: apply_dark_titlebar(self, self.actual_theme == "dark"))
         # Shrink window to content's natural height (no big empty space below)
         self.after(80, self._fit_window_to_content)
-        # On Mac: detect leftover utun interfaces from previous failed openvpn
-        # runs (they hijack the system default route and break internet).
-        # Run check on a slight delay so the UI is up first.
-        if IS_MAC:
-            self.after(800, self._mac_offer_orphan_cleanup)
         # When the user closes the window, kill running proxies + clean utuns
         self.protocol("WM_DELETE_WINDOW", self._on_close)
-
-    def _mac_offer_orphan_cleanup(self):
-        """If there are stale utun default-routes from earlier crashed openvpn,
-        offer one-click cleanup. Silent if everything is clean."""
-        orphans = self._mac_check_orphans()
-        if not orphans:
-            return
-        self.log_msg(
-            f"⚠ найдены VPN-остатки от прошлой сессии: {', '.join(orphans)} "
-            f"— перехватили дефолтный маршрут, могут ломать интернет"
-        )
-        ans = messagebox.askyesno(
-            "Остатки прошлой VPN-сессии",
-            "В системе остались интерфейсы от предыдущих неудачных подключений:\n\n"
-            f"  {', '.join(orphans)}\n\n"
-            "Они захватили default-маршрут — могут ломать интернет. "
-            "Очистить сейчас? (потребуется пароль)"
-        )
-        if ans:
-            self._mac_run_cleanup(
-                prompt="ZubriTunnel чистит остатки прошлых VPN-сессий",
-                kill_openvpn=True,
-            )
+        # Track utun device names that OUR openvpn allocates — used so the
+        # disconnect-time cleanup only destroys interfaces we actually created.
+        # Maps proxy-name -> "utunN". NEVER touch utuns we didn't put here.
+        self._our_utuns: dict[str, str] = {}
 
     def _on_close(self):
         """Window-close handler: stop all proxies (incl. ovpn cleanup), then exit."""
@@ -2192,12 +2168,16 @@ class App(tk.Tk):
                 # Cleanup ghost proxy entry
                 self.proxies.pop(k["name"], None)
                 self.after(0, lambda: (self._update_status_display(), self.refresh_keys()))
-                # Failed openvpn often leaves a stale utun + IPv6 default route
-                # that breaks all network traffic. Clean it up automatically.
-                if IS_MAC and self._mac_check_orphans():
-                    self.after(0, lambda: self._mac_run_cleanup(
-                        prompt="OpenVPN упал — ZubriTunnel чистит сетевые маршруты",
+                # Failed openvpn might have allocated a utun before crashing.
+                # If we managed to capture its name from the log, destroy ONLY
+                # that one (never blanket-destroy utuns — they're shared with
+                # iCloud Private Relay / Continuity / system VPN).
+                our_utun = self._our_utuns.pop(k["name"], None)
+                if IS_MAC and our_utun:
+                    self.after(0, lambda u=our_utun: self._mac_run_cleanup(
+                        prompt="OpenVPN упал — ZubriTunnel сносит свой utun",
                         kill_openvpn=True,
+                        destroy_utuns=[u],
                     ))
                 return
             try:
@@ -2213,6 +2193,15 @@ class App(tk.Tk):
                                 if line.strip():
                                     self.log_msg(f"{k['name']}: {line.strip()}")
                             last_emit = _t.time()
+                        # Capture which utun OpenVPN allocated — needed for
+                        # cleanup so we destroy ONLY our interface, never
+                        # iCloud / Continuity / system utuns.
+                        if k["name"] not in self._our_utuns:
+                            import re as _re
+                            m = _re.search(r"\b(utun\d+)\b", text)
+                            if m:
+                                self._our_utuns[k["name"]] = m.group(1)
+                                self.log_msg(f"{k['name']}: TUN device = {m.group(1)}")
                         if "Initialization Sequence Completed" in text:
                             self.after(0, lambda: (
                                 self.log_msg(f"{k['name']}: ✓ VPN tunnel up — system-wide"),
@@ -2371,9 +2360,18 @@ class App(tk.Tk):
             except Exception as e:
                 self.log_msg(f"не удалось остановить OpenVPN: {e}")
         elif IS_MAC:
+            # Find the proxy entry to grab the utun we recorded for it.
+            # If openvpn never reported its utun (early crash), destroy_utuns is [],
+            # which means osascript will only pkill — safe.
+            our_utun = None
+            for name, entry in list(self.proxies.items()):
+                if entry is p:
+                    our_utun = self._our_utuns.pop(name, None)
+                    break
             self._mac_run_cleanup(
-                prompt="ZubriTunnel останавливает OpenVPN и чистит маршруты",
+                prompt="ZubriTunnel останавливает OpenVPN",
                 kill_openvpn=True,
+                destroy_utuns=[our_utun] if our_utun else [],
             )
 
         # Clean up temp config and log
@@ -2384,53 +2382,32 @@ class App(tk.Tk):
                 except OSError:
                     pass
 
-    def _mac_check_orphans(self) -> list[str]:
-        """Return list of utunN interfaces that have a IPv6 link-local default
-        route pointing through them — these are leftovers from openvpn runs
-        that died before tearing down their TUN interface. Each one steals the
-        system default route, so even one orphan can break internet entirely.
-        No password / privileges needed for this check (read-only netstat)."""
-        if not IS_MAC:
-            return []
-        try:
-            r = subprocess.run(
-                ["netstat", "-rn", "-f", "inet6"],
-                capture_output=True, text=True, timeout=5,
-            )
-            orphans = set()
-            for line in r.stdout.splitlines():
-                parts = line.split()
-                # "default  fe80::%utunX  UGcIg  utunX"
-                if (len(parts) >= 4 and parts[0] == "default"
-                        and parts[-1].startswith("utun")):
-                    orphans.add(parts[-1])
-            return sorted(orphans)
-        except Exception:
-            return []
+    def _mac_run_cleanup(self, prompt: str, kill_openvpn: bool = True,
+                         destroy_utuns: list[str] | None = None) -> bool:
+        """Run elevated cleanup via a single osascript admin prompt.
 
-    def _mac_run_cleanup(self, prompt: str, kill_openvpn: bool = True) -> bool:
-        """Run elevated cleanup via a single osascript admin prompt:
-          - pkill openvpn (so it can't keep re-creating routes)
-          - route -inet6 flush  (drop bogus IPv6 defaults)
-          - ifconfig destroy  (remove orphan utun interfaces)
-
-        Returns True if cleanup script ran (rc==0), False on failure/cancel."""
+        SAFETY: never destroys utun interfaces we didn't allocate ourselves —
+        utun devices on macOS are also used by iCloud Private Relay, AirDrop,
+        Wi-Fi Calling, system VPN. Blindly destroying them can hard-lock the OS.
+        Caller MUST pass an explicit list of utun names that we KNOW our
+        openvpn created (parsed from openvpn's log). Empty list = skip destroy.
+        """
         if not IS_MAC:
             return False
-        orphans = self._mac_check_orphans()
-        # If there's nothing to do AND we're not killing openvpn, skip
-        if not orphans and not kill_openvpn:
-            return True
+        destroy_utuns = destroy_utuns or []
 
         lines: list[str] = []
         if kill_openvpn:
             lines.append("pkill -SIGTERM openvpn 2>/dev/null || true")
             lines.append("sleep 1")
             lines.append("pkill -KILL openvpn 2>/dev/null || true")
-        if orphans:
-            lines.append("route -inet6 flush 2>/dev/null || true")
-            for u in orphans:
+        for u in destroy_utuns:
+            # Only destroy interfaces named utunN — extra safety belt against
+            # accidentally passing en0 or something else that would break Wi-Fi.
+            if u.startswith("utun") and u[4:].isdigit():
                 lines.append(f"ifconfig {u} destroy 2>/dev/null || true")
+        if not lines:
+            return True
         lines.append("exit 0")
         script = "#!/bin/bash\n" + "\n".join(lines) + "\n"
 
@@ -2453,9 +2430,9 @@ class App(tk.Tk):
                 capture_output=True, text=True, timeout=30,
             )
             if r.returncode == 0:
-                if orphans:
-                    self.log_msg(f"✓ очищены VPN-остатки: {', '.join(orphans)}")
-                else:
+                if destroy_utuns:
+                    self.log_msg(f"✓ снесены наши utun: {', '.join(destroy_utuns)}")
+                if kill_openvpn:
                     self.log_msg("✓ OpenVPN остановлен")
                 return True
             else:
