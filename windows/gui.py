@@ -1136,6 +1136,52 @@ class App(tk.Tk):
         self.after(50, lambda: apply_dark_titlebar(self, self.actual_theme == "dark"))
         # Shrink window to content's natural height (no big empty space below)
         self.after(80, self._fit_window_to_content)
+        # On Mac: detect leftover utun interfaces from previous failed openvpn
+        # runs (they hijack the system default route and break internet).
+        # Run check on a slight delay so the UI is up first.
+        if IS_MAC:
+            self.after(800, self._mac_offer_orphan_cleanup)
+        # When the user closes the window, kill running proxies + clean utuns
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _mac_offer_orphan_cleanup(self):
+        """If there are stale utun default-routes from earlier crashed openvpn,
+        offer one-click cleanup. Silent if everything is clean."""
+        orphans = self._mac_check_orphans()
+        if not orphans:
+            return
+        self.log_msg(
+            f"⚠ найдены VPN-остатки от прошлой сессии: {', '.join(orphans)} "
+            f"— перехватили дефолтный маршрут, могут ломать интернет"
+        )
+        ans = messagebox.askyesno(
+            "Остатки прошлой VPN-сессии",
+            "В системе остались интерфейсы от предыдущих неудачных подключений:\n\n"
+            f"  {', '.join(orphans)}\n\n"
+            "Они захватили default-маршрут — могут ломать интернет. "
+            "Очистить сейчас? (потребуется пароль)"
+        )
+        if ans:
+            self._mac_run_cleanup(
+                prompt="ZubriTunnel чистит остатки прошлых VPN-сессий",
+                kill_openvpn=True,
+            )
+
+    def _on_close(self):
+        """Window-close handler: stop all proxies (incl. ovpn cleanup), then exit."""
+        try:
+            for name, p in list(self.proxies.items()):
+                try:
+                    if p.get("type") == "ovpn":
+                        self._stop_ovpn(p)
+                    else:
+                        proc = p.get("proc")
+                        if proc and proc.poll() is None:
+                            proc.terminate()
+                except Exception:
+                    pass
+        finally:
+            self.destroy()
 
     def _fit_window_to_content(self):
         try:
@@ -2125,6 +2171,13 @@ class App(tk.Tk):
                 # Cleanup ghost proxy entry
                 self.proxies.pop(k["name"], None)
                 self.after(0, lambda: (self._update_status_display(), self.refresh_keys()))
+                # Failed openvpn often leaves a stale utun + IPv6 default route
+                # that breaks all network traffic. Clean it up automatically.
+                if IS_MAC and self._mac_check_orphans():
+                    self.after(0, lambda: self._mac_run_cleanup(
+                        prompt="OpenVPN упал — ZubriTunnel чистит сетевые маршруты",
+                        kill_openvpn=True,
+                    ))
                 return
             try:
                 if os.path.exists(log_path):
@@ -2272,12 +2325,17 @@ class App(tk.Tk):
         self.refresh_keys()
 
     def _stop_ovpn(self, p: dict):
-        """Kill the elevated openvpn process and clean up tmp files."""
+        """Kill the elevated openvpn process AND clean up everything it left
+        behind (stale utun interfaces + IPv6 default routes pointing through
+        them) — otherwise multiple failed connect attempts pile up dead utuns
+        that hijack the system's default route and break internet.
+
+        On Mac one elevated osascript prompt covers kill + route flush + utun
+        destroy. On Windows the OpenVPN community client cleans up its own
+        TAP/Wintun interface, so just taskkill is enough."""
         cfg_path = p.get("config_path")
         log_path = p.get("log_path")
         if IS_WIN:
-            # taskkill needs admin to kill an elevated process. Run via PowerShell
-            # Start-Process -Verb RunAs which shows a single UAC prompt.
             try:
                 ps = (
                     "Start-Process -FilePath 'taskkill' "
@@ -2292,17 +2350,10 @@ class App(tk.Tk):
             except Exception as e:
                 self.log_msg(f"не удалось остановить OpenVPN: {e}")
         elif IS_MAC:
-            # Use osascript with administrator privileges to run pkill
-            try:
-                applescript = (
-                    'do shell script "pkill -SIGTERM openvpn || true" '
-                    'with administrator privileges '
-                    'with prompt "ZubriTunnel хочет остановить OpenVPN"'
-                )
-                subprocess.run(["osascript", "-e", applescript], timeout=15)
-                self.log_msg("OpenVPN остановлен (pkill, sudo)")
-            except Exception as e:
-                self.log_msg(f"не удалось остановить OpenVPN: {e}")
+            self._mac_run_cleanup(
+                prompt="ZubriTunnel останавливает OpenVPN и чистит маршруты",
+                kill_openvpn=True,
+            )
 
         # Clean up temp config and log
         for path in (cfg_path, log_path):
@@ -2311,6 +2362,94 @@ class App(tk.Tk):
                     os.unlink(path)
                 except OSError:
                     pass
+
+    def _mac_check_orphans(self) -> list[str]:
+        """Return list of utunN interfaces that have a IPv6 link-local default
+        route pointing through them — these are leftovers from openvpn runs
+        that died before tearing down their TUN interface. Each one steals the
+        system default route, so even one orphan can break internet entirely.
+        No password / privileges needed for this check (read-only netstat)."""
+        if not IS_MAC:
+            return []
+        try:
+            r = subprocess.run(
+                ["netstat", "-rn", "-f", "inet6"],
+                capture_output=True, text=True, timeout=5,
+            )
+            orphans = set()
+            for line in r.stdout.splitlines():
+                parts = line.split()
+                # "default  fe80::%utunX  UGcIg  utunX"
+                if (len(parts) >= 4 and parts[0] == "default"
+                        and parts[-1].startswith("utun")):
+                    orphans.add(parts[-1])
+            return sorted(orphans)
+        except Exception:
+            return []
+
+    def _mac_run_cleanup(self, prompt: str, kill_openvpn: bool = True) -> bool:
+        """Run elevated cleanup via a single osascript admin prompt:
+          - pkill openvpn (so it can't keep re-creating routes)
+          - route -inet6 flush  (drop bogus IPv6 defaults)
+          - ifconfig destroy  (remove orphan utun interfaces)
+
+        Returns True if cleanup script ran (rc==0), False on failure/cancel."""
+        if not IS_MAC:
+            return False
+        orphans = self._mac_check_orphans()
+        # If there's nothing to do AND we're not killing openvpn, skip
+        if not orphans and not kill_openvpn:
+            return True
+
+        lines: list[str] = []
+        if kill_openvpn:
+            lines.append("pkill -SIGTERM openvpn 2>/dev/null || true")
+            lines.append("sleep 1")
+            lines.append("pkill -KILL openvpn 2>/dev/null || true")
+        if orphans:
+            lines.append("route -inet6 flush 2>/dev/null || true")
+            for u in orphans:
+                lines.append(f"ifconfig {u} destroy 2>/dev/null || true")
+        lines.append("exit 0")
+        script = "#!/bin/bash\n" + "\n".join(lines) + "\n"
+
+        import tempfile
+        f = tempfile.NamedTemporaryFile(
+            "w", suffix=".sh", delete=False,
+            prefix="zubri-cleanup-", encoding="utf-8",
+        )
+        f.write(script)
+        f.close()
+        os.chmod(f.name, 0o755)
+        applescript = (
+            f'do shell script "/bin/bash {shlex.quote(f.name)}" '
+            f'with administrator privileges '
+            f'with prompt "{prompt}"'
+        )
+        try:
+            r = subprocess.run(
+                ["osascript", "-e", applescript],
+                capture_output=True, text=True, timeout=30,
+            )
+            if r.returncode == 0:
+                if orphans:
+                    self.log_msg(f"✓ очищены VPN-остатки: {', '.join(orphans)}")
+                else:
+                    self.log_msg("✓ OpenVPN остановлен")
+                return True
+            else:
+                err = (r.stderr or "").strip()
+                if "User canceled" in err or "User cancel" in err:
+                    self.log_msg("очистка отменена пользователем")
+                else:
+                    self.log_msg(f"очистка упала: {err or 'rc=' + str(r.returncode)}")
+                return False
+        except Exception as e:
+            self.log_msg(f"очистка упала: {e}")
+            return False
+        finally:
+            try: os.unlink(f.name)
+            except OSError: pass
 
     def _poll_procs(self):
         died = [name for name, p in self.proxies.items() if p["proc"].poll() is not None]
