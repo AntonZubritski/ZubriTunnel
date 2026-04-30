@@ -799,14 +799,35 @@ SETTINGS_FILE = SCRIPT_DIR / "settings.json"
 
 
 def read_app_version() -> str:
-    """Get app version. CI writes the tag (e.g. '1.0.36') into VERSION file
-    next to gui.py before packaging — so the GUI can show 'which build is this'."""
+    """Get app version. Tries multiple sources, in priority order:
+       1. macOS: CFBundleShortVersionString from Info.plist (most reliable —
+          CI's PlistBuddy step always bumps it; the .pkg always carries it)
+       2. VERSION text file next to gui.py / inside PyInstaller bundle
+       3. fallback "dev"
+    """
+    # Mac: read Info.plist directly — that's the canonical version macOS uses
+    if sys.platform == "darwin":
+        for plist in (
+            SCRIPT_DIR.parent / "Info.plist",        # ../Resources/.. → Info.plist
+            SCRIPT_DIR.parent.parent / "Info.plist", # safety
+        ):
+            try:
+                if plist.is_file():
+                    import plistlib
+                    with open(plist, "rb") as f:
+                        data = plistlib.load(f)
+                    v = (data.get("CFBundleShortVersionString") or "").strip()
+                    if v and v != "1.0":  # "1.0" = un-stamped default in repo
+                        return v
+            except Exception:
+                pass
+    # Cross-platform: VERSION text file
     for cand in (
-        BUNDLE_DIR / "VERSION",                       # PyInstaller --add-data target
-        SCRIPT_DIR / "VERSION",                       # next to .exe / gui.py
+        BUNDLE_DIR / "VERSION",
+        SCRIPT_DIR / "VERSION",
         SCRIPT_DIR.parent / "VERSION",
         BUNDLE_DIR.parent / "VERSION",
-        BUNDLE_DIR.parent / "Resources" / "VERSION",  # .app/Contents/Resources
+        BUNDLE_DIR.parent / "Resources" / "VERSION",
     ):
         try:
             if cand.is_file():

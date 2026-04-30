@@ -132,13 +132,17 @@ jobs:
 
       - name: Stamp VERSION + Info.plist with tag
         run: |
-          TAG="${GITHUB_REF#refs/tags/v}"
+          # Resolve TAG. github.ref_name is "v1.0.X" for tag pushes;
+          # workflow_dispatch passes a manual `tag` input.
+          TAG="${{ github.ref_name }}"
           [ -z "$TAG" ] && TAG="${{ github.event.inputs.tag }}"
           TAG="${TAG#v}"
           [ -z "$TAG" ] && TAG="dev"
-          echo "$TAG" > VERSION
-          # Mirror VERSION into the .app's Resources so the GUI can find it
-          cp VERSION mac/ZubriTunnel.app/Contents/Resources/VERSION
+          # Write VERSION via printf (no trailing newline issues)
+          printf '%s' "$TAG" > VERSION
+          printf '%s' "$TAG" > mac/ZubriTunnel.app/Contents/Resources/VERSION
+          ls -la VERSION mac/ZubriTunnel.app/Contents/Resources/VERSION
+          cat VERSION
           # Bump version EVERYWHERE macOS shows it:
           #   - CFBundleShortVersionString → Get Info / About
           #   - CFBundleVersion            → internal build version
