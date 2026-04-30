@@ -2184,14 +2184,18 @@ class App(tk.Tk):
                     return
                 proxy = f"http://{active['addr']}"
                 subprocess.run(["git", "config", "--global", "http.proxy", proxy],
-                               env=enhanced_path_env(, **_win_subprocess_kwargs()), check=True)
+                               env=enhanced_path_env(), check=True,
+                               **_win_subprocess_kwargs())
                 subprocess.run(["git", "config", "--global", "https.proxy", proxy],
-                               env=enhanced_path_env(, **_win_subprocess_kwargs()), check=True)
+                               env=enhanced_path_env(), check=True,
+                               **_win_subprocess_kwargs())
                 self.log_msg(f"git: http.proxy={proxy} (global)")
                 messagebox.showinfo("git", f"Все git-команды теперь через {proxy}.\nНе забудь выключить, когда наскучит.")
             else:
-                subprocess.run(["git", "config", "--global", "--unset", "http.proxy"], env=enhanced_path_env(, **_win_subprocess_kwargs()))
-                subprocess.run(["git", "config", "--global", "--unset", "https.proxy"], env=enhanced_path_env(, **_win_subprocess_kwargs()))
+                subprocess.run(["git", "config", "--global", "--unset", "http.proxy"],
+                               env=enhanced_path_env(), **_win_subprocess_kwargs())
+                subprocess.run(["git", "config", "--global", "--unset", "https.proxy"],
+                               env=enhanced_path_env(), **_win_subprocess_kwargs())
                 self.log_msg("git: proxy unset")
                 messagebox.showinfo("git", "git proxy выключен.")
         except FileNotFoundError:
@@ -2469,8 +2473,9 @@ class App(tk.Tk):
         try:
             go = find_go_binary() or "go"
             r = subprocess.run([go, "build", "-o", out, "."],
-                               cwd=workdir, env=enhanced_path_env(, **_win_subprocess_kwargs()),
-                               capture_output=True, text=True, timeout=180)
+                               cwd=workdir, env=enhanced_path_env(),
+                               capture_output=True, text=True, timeout=180,
+                               **_win_subprocess_kwargs())
             if r.returncode == 0:
                 self.log_msg(f"vpn-proxy собран: {out}")
                 self.after(0, lambda: messagebox.showinfo("Готово", f"vpn-proxy собран: {out}"))
