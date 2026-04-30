@@ -127,14 +127,40 @@ jobs:
             mac README.md VERSION install.sh
           ls -lh dist/
 
-      - name: Build macOS .pkg installer (drag-drop alternative to tarball)
+      - name: Build macOS .pkg installer with postinstall fix-up
         run: |
           mkdir -p dist
-          # productbuild makes a flat .pkg that double-clicks → installer wizard → /Applications
+          # postinstall script restores executable bits, re-signs ad-hoc, and
+          # strips the install quarantine that some macOS versions add even
+          # to apps placed by Apple's installer.
+          mkdir -p scripts
+          cat > scripts/postinstall <<'EOF'
+          #!/bin/bash
+          APP="/Applications/ZubriTunnel.app"
+          # Restore executable bits (pkgbuild's --ownership recommended sometimes wipes them)
+          chmod 755 "$APP/Contents/MacOS/launcher" 2>/dev/null
+          chmod 755 "$APP/Contents/MacOS/vpn-proxy" 2>/dev/null
+          chmod 755 "$APP/Contents/Resources/install_deps.sh" 2>/dev/null
+          for arch in arm64 x86_64; do
+            for f in "$APP/Contents/Frameworks/Python-$arch/bin/"*; do
+              [ -f "$f" ] && chmod 755 "$f" 2>/dev/null
+            done
+          done
+          # Re-sign the bundle ad-hoc (pkgbuild's payload extraction strips the
+          # original signature on some macOS versions)
+          /usr/bin/codesign --force --deep --sign - "$APP" 2>/dev/null || true
+          # Strip quarantine so Gatekeeper doesn't block the freshly-installed app
+          /usr/bin/xattr -dr com.apple.quarantine "$APP" 2>/dev/null || true
+          exit 0
+          EOF
+          chmod +x scripts/postinstall
+
           pkgbuild --root mac/ZubriTunnel.app \
                    --identifier local.zubritunnel \
                    --version "${GITHUB_REF#refs/tags/v}" \
                    --install-location "/Applications/ZubriTunnel.app" \
+                   --ownership preserve \
+                   --scripts scripts \
                    dist/ZubriTunnel.pkg
           ls -lh dist/
 
