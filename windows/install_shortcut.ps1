@@ -9,25 +9,25 @@ $ws = New-Object -ComObject WScript.Shell
 $desktop = [Environment]::GetFolderPath('Desktop')
 $shortcutPath = "$desktop\ZubriTunnel.lnk"
 
-# найти pythonw.exe (без консоли) или python.exe
-$python = (Get-Command python -ErrorAction SilentlyContinue).Source
-if (-not $python) {
-    $python = (Get-Command python3 -ErrorAction SilentlyContinue).Source
-}
-
-if ($python) {
-    $pyDir = Split-Path $python
-    $pythonw = Join-Path $pyDir "pythonw.exe"
-    if (Test-Path $pythonw) {
-        $target = $pythonw
-    } else {
-        $target = $python
-    }
-    $arguments = "`"$PSScriptRoot\gui.py`""
-} else {
-    Write-Warning "Python не найден в PATH. Ярлык будет указывать на gui.bat."
-    $target = "$PSScriptRoot\gui.bat"
+# Prefer the standalone ZubriTunnel.exe (PyInstaller bundle, no Python needed).
+# Fall back to gui.bat / pythonw gui.py only in dev mode (git clone without build).
+$zubri_exe = Join-Path $PSScriptRoot 'ZubriTunnel.exe'
+if (Test-Path $zubri_exe) {
+    $target = $zubri_exe
     $arguments = ""
+} else {
+    $python = (Get-Command python -ErrorAction SilentlyContinue).Source
+    if (-not $python) { $python = (Get-Command python3 -ErrorAction SilentlyContinue).Source }
+    if ($python) {
+        $pyDir = Split-Path $python
+        $pythonw = Join-Path $pyDir "pythonw.exe"
+        $target = if (Test-Path $pythonw) { $pythonw } else { $python }
+        $arguments = "`"$PSScriptRoot\gui.py`""
+    } else {
+        Write-Warning "Python не найден в PATH. Ярлык будет указывать на gui.bat."
+        $target = "$PSScriptRoot\gui.bat"
+        $arguments = ""
+    }
 }
 
 $shortcut = $ws.CreateShortcut($shortcutPath)

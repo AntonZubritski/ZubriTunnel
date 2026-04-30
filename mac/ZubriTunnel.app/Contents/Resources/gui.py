@@ -17,11 +17,28 @@ import urllib.request
 from pathlib import Path
 from tkinter import filedialog, messagebox, scrolledtext, simpledialog, ttk
 
-SCRIPT_DIR = Path(__file__).resolve().parent
+# Paths — handle both dev mode (python gui.py) and PyInstaller-frozen .exe.
+# Frozen .exe extracts itself to a temp _MEIPASS at runtime; user-writable
+# data (keys/, settings.json) must live next to the .exe instead.
+if getattr(sys, "frozen", False):
+    SCRIPT_DIR = Path(sys.executable).resolve().parent  # next to ZubriTunnel.exe
+    BUNDLE_DIR = Path(getattr(sys, "_MEIPASS", str(SCRIPT_DIR)))
+else:
+    SCRIPT_DIR = Path(__file__).resolve().parent
+    BUNDLE_DIR = SCRIPT_DIR
 KEYS_DIR = SCRIPT_DIR / "keys"
 DEFAULT_ADDR = "127.0.0.1:8080"
 IS_WIN = os.name == "nt"
 IS_MAC = sys.platform == "darwin"
+
+
+def bundled_resource(name: str) -> Path:
+    """Locate a read-only resource (icon, image) in the PyInstaller bundle
+    OR next to gui.py in dev mode."""
+    p = BUNDLE_DIR / name
+    if p.exists():
+        return p
+    return SCRIPT_DIR / name
 
 
 # ---------- helpers ----------
@@ -1017,11 +1034,10 @@ class App(tk.Tk):
         return 1.0
 
     def _set_window_icon(self):
-        ico = SCRIPT_DIR / "icon.ico"
-        png = SCRIPT_DIR / "icon.png"
+        ico = bundled_resource("icon.ico")
+        png = bundled_resource("icon.png")
         try:
             if IS_WIN and ico.exists():
-                # Set both this window's icon AND the default for any future Toplevel
                 self.iconbitmap(default=str(ico))
                 self.iconbitmap(str(ico))
             if png.exists():
