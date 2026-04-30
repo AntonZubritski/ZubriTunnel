@@ -99,6 +99,26 @@ fi
     echo "=== $(date) ==="
     echo "workdir: $RES"
     echo "python:  $PY ($($PY --version 2>&1))"
+
+    # Tell Tcl/Tk where its runtime library lives. python-build-standalone
+    # bakes /tools/deps/lib/tcl8.6 into the binary at build-time — that path
+    # doesn't exist on the user's Mac, so Tk fails with 'init.tcl not found'.
+    # Both libs ship inside the bundled Python's lib/ directory.
+    PY_PREFIX="$(dirname "$(dirname "$PY")")"
+    for v in 8.6 8.7 9.0; do
+        if [ -d "$PY_PREFIX/lib/tcl${v}" ]; then
+            export TCL_LIBRARY="$PY_PREFIX/lib/tcl${v}"
+            break
+        fi
+    done
+    for v in 8.6 8.7 9.0; do
+        if [ -d "$PY_PREFIX/lib/tk${v}" ]; then
+            export TK_LIBRARY="$PY_PREFIX/lib/tk${v}"
+            break
+        fi
+    done
+    echo "TCL_LIBRARY: ${TCL_LIBRARY:-<not set>}"
+    echo "TK_LIBRARY:  ${TK_LIBRARY:-<not set>}"
     echo ""
     # exec -a "ZubriTunnel" rewrites argv[0] so 'ps', Activity Monitor and
     # macOS process name show 'ZubriTunnel' instead of 'python3'.
