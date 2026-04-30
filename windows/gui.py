@@ -211,6 +211,26 @@ def check_dependencies() -> list:
             "fix_action": "install_brew" if not brew else None,
         })
 
+    # OpenVPN (нужен только для .ovpn ключей, поэтому detail объясняет это)
+    ovpn = find_openvpn_binary()
+    if ovpn:
+        # Различаем bundled внутри .app/Frameworks vs system install
+        is_bundled = (
+            "Frameworks/openvpn" in ovpn.replace("\\", "/")
+            or "windows/openvpn" in ovpn.replace("\\", "/")
+            or "windows\\openvpn" in ovpn
+        )
+        detail = f"{ovpn}  (встроен в ZubriTunnel)" if is_bundled else ovpn
+    else:
+        detail = "не найден — нужен для подключения .ovpn ключей. Нажми «Установить»."
+    deps.append({
+        "name": "OpenVPN",
+        "ok": ovpn is not None,
+        "detail": detail,
+        "fix_label": "Установить" if not ovpn else None,
+        "fix_action": "install_openvpn" if not ovpn else None,
+    })
+
     return deps
 
 
@@ -1931,13 +1951,17 @@ class App(tk.Tk):
             return
         ovpn_bin = find_openvpn_binary()
         if not ovpn_bin:
-            messagebox.showerror(
-                "OpenVPN не установлен",
-                "Поставь OpenVPN-клиент:\n\n"
-                "  • Mac:  brew install openvpn  (или скачай Tunnelblick)\n"
-                "  • Win:  https://openvpn.net/community-downloads/\n\n"
-                "После установки попробуй ещё раз."
+            # Открываем "Системные зависимости" — там ровно строка OpenVPN
+            # с кнопкой «Установить», вместо тупикового messagebox.
+            self.log_msg(
+                f"{k['name']}: OpenVPN не найден — открываю «Системные зависимости»"
             )
+            messagebox.showinfo(
+                "Нужен OpenVPN",
+                "Для .ovpn ключей нужен openvpn-клиент. "
+                "Сейчас открою «Системные зависимости» — там нажми «Установить» рядом с OpenVPN."
+            )
+            self.show_deps_dialog()
             return
 
         # Write the ovpn config to a temp file so we can pass --config <path>
@@ -2827,6 +2851,8 @@ class App(tk.Tk):
             self._install_go()
         elif action == "install_brew":
             self._install_brew()
+        elif action == "install_openvpn":
+            self._install_openvpn()
         if parent_win is not None:
             try:
                 parent_win.destroy()
@@ -2892,6 +2918,26 @@ class App(tk.Tk):
             return
         cmd = '/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"'
         self._open_terminal_install(cmd)
+
+    def _install_openvpn(self):
+        if IS_MAC:
+            brew = shutil.which("brew") or "/opt/homebrew/bin/brew"
+            if os.path.exists(brew):
+                arch_prefix = "arch -arm64 " if "/opt/homebrew" in brew else ""
+                self._open_terminal_install(f"{arch_prefix}{brew} install openvpn")
+            else:
+                messagebox.showinfo("Сначала Homebrew",
+                    "Сначала установи Homebrew (есть кнопка в «проверке системы»),\n"
+                    "потом обнови проверку и нажми «Установить» рядом с OpenVPN.\n\n"
+                    "Альтернатива: скачай Tunnelblick — https://tunnelblick.net")
+        elif IS_WIN:
+            import webbrowser
+            webbrowser.open("https://openvpn.net/community-downloads/")
+            messagebox.showinfo("Скачай OpenVPN",
+                "Открыл https://openvpn.net/community-downloads/ — скачай OpenVPN MSI и поставь.\n\n"
+                "После установки перезапусти ZubriTunnel — бинарник найдётся автоматически.")
+        else:
+            self._open_terminal_install("sudo apt-get install -y openvpn || sudo dnf install -y openvpn")
 
     def _open_terminal_install(self, command: str):
         """Открыть Terminal/cmd с командой установки."""
