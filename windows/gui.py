@@ -1966,15 +1966,22 @@ class App(tk.Tk):
         threading.Thread(target=self._wait_ovpn_ready, args=(k, log_path), daemon=True).start()
 
     def _spawn_ovpn(self, ovpn_bin: str, cfg_path: str, log_path: str):
-        """Запустить openvpn с elevation. Возвращает Popen-подобный объект (на Windows
-        это launcher-процесс PowerShell; на Mac — sh с osascript). Реальный openvpn
-        работает как root."""
+        """Запустить openvpn с elevation. На Windows — UAC через PowerShell.
+        На macOS — пароль через osascript. Реальный openvpn работает как root."""
+        # Pre-create log file with user-permissions so we (non-root) can read it
+        # even when openvpn (root) appends to it. Without this, root creates the
+        # file with mode 0640 root:wheel and our log-watcher thread can't read.
+        try:
+            Path(log_path).write_text("")  # empty file, owner=user, mode=user umask
+            os.chmod(log_path, 0o666)
+        except Exception:
+            pass
+
         cfg_dir = os.path.dirname(cfg_path)
         if IS_WIN:
-            # PowerShell Start-Process -Verb RunAs показывает UAC prompt
             ps = (
                 f'$p = Start-Process -FilePath \'{ovpn_bin}\' '
-                f'-ArgumentList \'--config\',\'{cfg_path}\',\'--log\',\'{log_path}\' '
+                f'-ArgumentList \'--config\',\'{cfg_path}\',\'--log-append\',\'{log_path}\' '
                 f'-WorkingDirectory \'{cfg_dir}\' -Verb RunAs -PassThru -WindowStyle Hidden; '
                 f'$p.Id'
             )
@@ -1989,16 +1996,32 @@ class App(tk.Tk):
                 messagebox.showerror("Ошибка запуска OpenVPN", str(e))
                 return None
         elif IS_MAC:
-            # osascript with administrator privileges запросит пароль через native dialog
-            cmd = f"{shlex.quote(ovpn_bin)} --config {shlex.quote(cfg_path)} --log {shlex.quote(log_path)} --daemon"
-            applescript = (
-                f'do shell script "{cmd}" '
-                f'with administrator privileges '
-                f'with prompt "ZubriTunnel хочет запустить OpenVPN — нужен пароль администратора"'
+            # Foreground (no --daemon) so:
+            #  - osascript stays alive while openvpn runs, our Popen handle stays alive
+            #  - poll() detects when openvpn dies on its own (e.g. Gatekeeper block)
+            #  - --log-append uses our pre-created world-readable file
+            #
+            # AppleScript wrapping:
+            #  - 'with timeout of 86400 seconds' otherwise do-shell-script aborts at 120s
+            #  - 2>&1 redirects openvpn stderr into the same log so we see startup errors
+            cmd = (
+                f"{shlex.quote(ovpn_bin)} "
+                f"--config {shlex.quote(cfg_path)} "
+                f"--log-append {shlex.quote(log_path)} "
+                f">> {shlex.quote(log_path)} 2>&1"
             )
             try:
                 proc = subprocess.Popen(
-                    ["osascript", "-e", applescript],
+                    [
+                        "osascript",
+                        "-e", "with timeout of 86400 seconds",
+                        "-e", (
+                            f'do shell script "{cmd}" '
+                            f'with administrator privileges '
+                            f'with prompt "ZubriTunnel хочет запустить OpenVPN — нужен пароль администратора"'
+                        ),
+                        "-e", "end timeout",
+                    ],
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                 )
                 return proc
@@ -2010,29 +2033,92 @@ class App(tk.Tk):
             return None
 
     def _wait_ovpn_ready(self, k: dict, log_path: str):
-        """Парсим лог OpenVPN до 'Initialization Sequence Completed' = коннект готов."""
+        """Парсим лог OpenVPN до 'Initialization Sequence Completed' = коннект готов.
+        Также периодически логируем последние строки в наш лог чтобы юзер видел прогресс."""
         import time as _t
-        deadline = _t.time() + 30
+        deadline = _t.time() + 60  # generous timeout
+        last_log_size = 0
+        last_emit = 0
+        proxy_entry = self.proxies.get(k["name"], {})
+        proc = proxy_entry.get("proc")
         while _t.time() < deadline:
+            # If the elevation wrapper (osascript / powershell) died, OpenVPN
+            # never started or exited. Surface that quickly instead of waiting 60s.
+            if proc is not None and proc.poll() is not None:
+                rc = proc.returncode
+                stderr = ""
+                try:
+                    stderr = (proc.stderr.read() or "").strip()
+                except Exception:
+                    pass
+                tail = ""
+                try:
+                    tail = "\n".join(
+                        Path(log_path).read_text(encoding="utf-8", errors="replace")
+                        .splitlines()[-15:]
+                    )
+                except Exception:
+                    pass
+                if rc != 0 and "User cancel" in stderr:
+                    self.log_msg(f"{k['name']}: пароль не введён, отмена")
+                else:
+                    msg_parts = [f"OpenVPN не запустился (код {rc})."]
+                    if stderr: msg_parts.append(f"\nstderr:\n{stderr}")
+                    if tail:   msg_parts.append(f"\nlog:\n{tail}")
+                    if not stderr and not tail:
+                        msg_parts.append(
+                            "\nЛог пустой — возможно binary заблокирован Gatekeeper.\n"
+                            "Попробуй: xattr -dr com.apple.quarantine /Applications/ZubriTunnel.app"
+                        )
+                    full = "\n".join(msg_parts)
+                    self.log_msg(f"{k['name']}: {full}")
+                    self.after(0, lambda m=full: messagebox.showerror("OpenVPN — сбой", m))
+                # Cleanup ghost proxy entry
+                self.proxies.pop(k["name"], None)
+                self.after(0, lambda: (self._update_status_display(), self.refresh_keys()))
+                return
             try:
                 if os.path.exists(log_path):
-                    text = Path(log_path).read_text(encoding="utf-8", errors="replace")
-                    if "Initialization Sequence Completed" in text:
-                        self.after(0, lambda: (
-                            self.log_msg(f"{k['name']}: VPN tunnel up — system-wide"),
-                            self._update_status_display(),
-                            self.refresh_keys(),
-                        ))
-                        return
-                    if "AUTH_FAILED" in text or "Cannot allocate TUN" in text:
-                        snippet = "\n".join(text.splitlines()[-10:])
-                        self.after(0, lambda s=snippet: messagebox.showerror(
-                            "OpenVPN ошибка", f"Сбой подключения:\n\n{s}"))
-                        return
+                    size = os.path.getsize(log_path)
+                    if size > last_log_size:
+                        # New content — log a few interesting lines
+                        text = Path(log_path).read_text(encoding="utf-8", errors="replace")
+                        last_log_size = size
+                        # Emit last interesting line every 3 sec
+                        if _t.time() - last_emit > 3:
+                            for line in text.splitlines()[-3:]:
+                                if line.strip():
+                                    self.log_msg(f"{k['name']}: {line.strip()}")
+                            last_emit = _t.time()
+                        if "Initialization Sequence Completed" in text:
+                            self.after(0, lambda: (
+                                self.log_msg(f"{k['name']}: ✓ VPN tunnel up — system-wide"),
+                                self._update_status_display(),
+                                self.refresh_keys(),
+                            ))
+                            return
+                        if "AUTH_FAILED" in text:
+                            self.after(0, lambda: messagebox.showerror(
+                                "OpenVPN: auth failed",
+                                "Сервер отклонил аутентификацию. Проверь логин/пароль или сертификат в .ovpn."))
+                            return
+                        if "Cannot allocate TUN" in text or "TUN_ERROR" in text:
+                            self.after(0, lambda: messagebox.showerror(
+                                "OpenVPN: TUN error",
+                                "Не получилось создать сетевой интерфейс. Проверь что нет конфликтующих VPN-клиентов."))
+                            return
             except Exception:
                 pass
             _t.sleep(1.0)
-        self.log_msg(f"{k['name']}: timed out waiting for VPN tunnel — see {log_path}")
+        self.log_msg(f"{k['name']}: timeout 60s — see {log_path}")
+        # Emit tail of log so user sees what was happening
+        try:
+            text = Path(log_path).read_text(encoding="utf-8", errors="replace")
+            for line in text.splitlines()[-15:]:
+                if line.strip():
+                    self.log_msg(f"  {line.strip()}")
+        except Exception:
+            pass
 
     def _wait_listening(self, proc: subprocess.Popen, k: dict, addr: str):
         marker = f"listening on http://{addr}"
