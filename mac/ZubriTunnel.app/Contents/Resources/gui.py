@@ -890,6 +890,8 @@ class App(tk.Tk):
 
         self.proxies: dict[str, dict] = {}
         self.log_lock = threading.Lock()
+        # Windows Job Object — auto-kills vpn-proxy subprocesses when ZubriTunnel exits
+        self.win_job = WindowsJobObject()
 
         self._build_ui()
         self.refresh_keys()
@@ -1609,6 +1611,9 @@ class App(tk.Tk):
             if IS_WIN:
                 popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
             proc = subprocess.Popen(cmd, **popen_kwargs)
+            # Bind to job so vpn-proxy is killed when ZubriTunnel exits, even on hard crash
+            if IS_WIN:
+                self.win_job.assign(proc)
         except FileNotFoundError as e:
             messagebox.showerror(
                 "Не получилось запустить vpn-proxy",
@@ -2430,6 +2435,78 @@ def setup_windows_dpi():
         pass
 
 
+class WindowsJobObject:
+    """Job Object для авто-убийства всех vpn-proxy дочек при выходе ZubriTunnel.
+    Когда последний handle на job закрывается (mainloop exit / process death),
+    Windows сам убивает все assigned-процессы в группе.
+    No-op на не-Windows и при ошибках — просто молча fallback."""
+
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
+
+    def __init__(self):
+        self.h_job = None
+        if os.name != "nt":
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            class IO_COUNTERS(ctypes.Structure):
+                _fields_ = [(n, ctypes.c_ulonglong) for n in (
+                    "ReadOperationCount", "WriteOperationCount", "OtherOperationCount",
+                    "ReadTransferCount", "WriteTransferCount", "OtherTransferCount",
+                )]
+
+            class JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+                _fields_ = [
+                    ("PerProcessUserTimeLimit", ctypes.c_int64),
+                    ("PerJobUserTimeLimit", ctypes.c_int64),
+                    ("LimitFlags", wintypes.DWORD),
+                    ("MinimumWorkingSetSize", ctypes.c_size_t),
+                    ("MaximumWorkingSetSize", ctypes.c_size_t),
+                    ("ActiveProcessLimit", wintypes.DWORD),
+                    ("Affinity", ctypes.c_void_p),
+                    ("PriorityClass", wintypes.DWORD),
+                    ("SchedulingClass", wintypes.DWORD),
+                ]
+
+            class JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+                _fields_ = [
+                    ("BasicLimitInformation", JOBOBJECT_BASIC_LIMIT_INFORMATION),
+                    ("IoInfo", IO_COUNTERS),
+                    ("ProcessMemoryLimit", ctypes.c_size_t),
+                    ("JobMemoryLimit", ctypes.c_size_t),
+                    ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                    ("PeakJobMemoryUsed", ctypes.c_size_t),
+                ]
+
+            k32 = ctypes.windll.kernel32
+            k32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+            k32.CreateJobObjectW.restype = wintypes.HANDLE
+            self.h_job = k32.CreateJobObjectW(None, None)
+            if not self.h_job:
+                return
+            info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+            info.BasicLimitInformation.LimitFlags = self.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+            k32.SetInformationJobObject(
+                self.h_job, 9,  # JobObjectExtendedLimitInformation
+                ctypes.byref(info), ctypes.sizeof(info),
+            )
+            self._k32 = k32
+        except Exception:
+            self.h_job = None
+
+    def assign(self, proc):
+        """Привязать subprocess.Popen объект к job. После этого процесс умрёт
+        вместе с job при exit'е ZubriTunnel."""
+        if not self.h_job or os.name != "nt":
+            return
+        try:
+            self._k32.AssignProcessToJobObject(self.h_job, int(proc._handle))
+        except Exception:
+            pass
+
+
 def setup_windows_taskbar_id():
     """Claim a unique AppUserModelID so the taskbar shows our icon and doesn't
     group us under pythonw.exe."""
@@ -2524,11 +2601,21 @@ def main():
     setup_macos_app_name("ZubriTunnel")
     KEYS_DIR.mkdir(exist_ok=True)
     app = App()
-    # Tell Tk our app name (helps on some systems for window title / X11)
     try:
         app.tk.call("tk", "appname", "ZubriTunnel")
     except Exception:
         pass
+    # Register atexit so even hard crashes / Ctrl-C kill child vpn-proxy on Windows
+    import atexit
+    def _kill_all_subprocs():
+        for name in list(app.proxies.keys()):
+            try:
+                p = app.proxies.get(name)
+                if p and p.get("proc") and p["proc"].poll() is None:
+                    p["proc"].kill()
+            except Exception:
+                pass
+    atexit.register(_kill_all_subprocs)
     def on_close():
         for name in list(app.proxies.keys()):
             try:
