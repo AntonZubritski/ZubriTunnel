@@ -1104,7 +1104,7 @@ def apply_theme(root: tk.Tk, mode: str = "system"):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title(APP_NAME)
+        self.title(f"{APP_NAME} v{APP_VERSION}")
         # Compute DPI scale and resize fonts/window accordingly
         self._dpi_scale = self._detect_dpi_scale()
         try:
@@ -3232,11 +3232,11 @@ def setup_macos_app_name(name: str = "ZubriTunnel"):
 def main():
     setup_windows_dpi()
     setup_windows_taskbar_id()
-    setup_macos_app_name("ZubriTunnel")
+    setup_macos_app_name(f"ZubriTunnel v{APP_VERSION}")
     KEYS_DIR.mkdir(exist_ok=True)
     app = App()
     try:
-        app.tk.call("tk", "appname", "ZubriTunnel")
+        app.tk.call("tk", "appname", f"ZubriTunnel v{APP_VERSION}")
     except Exception:
         pass
     # Register atexit so even hard crashes / Ctrl-C cleanup
