@@ -159,7 +159,16 @@ def main():
 
     (ROOT / "mac").mkdir(exist_ok=True)
     (ROOT / "mac" / "icon.png").write_bytes(mac_pngs_round[256])
-    (ROOT / "mac" / "icon.icns").write_bytes(make_icns(mac_pngs_round))
+    icns_bytes = make_icns(mac_pngs_round)
+    (ROOT / "mac" / "icon.icns").write_bytes(icns_bytes)
+
+    # ALSO write inside the .app bundle — that's the icon macOS reads via
+    # CFBundleIconFile. Without this, the bundled icon stays the old version.
+    bundle_res = ROOT / "mac" / "ZubriTunnel.app" / "Contents" / "Resources"
+    if bundle_res.exists():
+        (bundle_res / "icon.icns").write_bytes(icns_bytes)
+        (bundle_res / "icon.png").write_bytes(mac_pngs_round[256])
+        print(f"  also wrote: {bundle_res}/icon.icns  +  icon.png")
 
     print("\nWritten:")
     for f in (ROOT / "windows" / "icon.ico", ROOT / "windows" / "icon.png",

@@ -2437,9 +2437,14 @@ def setup_windows_taskbar_id():
         return
     try:
         import ctypes
-        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
-            "local.zubritunnel.gui"
-        )
+        from ctypes import wintypes
+        # SetCurrentProcessExplicitAppUserModelID expects PCWSTR (wide string).
+        # Without argtypes ctypes passes a UTF-8 byte string, the call silently
+        # fails, and the taskbar groups under pythonw.exe (with the Python icon).
+        fn = ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID
+        fn.argtypes = [wintypes.LPCWSTR]
+        fn.restype = ctypes.c_long
+        fn("local.zubritunnel.gui")
     except Exception:
         pass
 
