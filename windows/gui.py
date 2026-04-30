@@ -56,6 +56,44 @@ def sanitize_json_bytes(data: bytes) -> bytes:
     return bytes(out)
 
 
+def find_go_binary() -> str | None:
+    """Найти `go` даже если PATH урезан (.app часто стартует без Homebrew в PATH)."""
+    p = shutil.which("go")
+    if p:
+        return p
+    candidates = [
+        "/opt/homebrew/bin/go",      # Apple Silicon Homebrew
+        "/usr/local/bin/go",          # Intel Homebrew
+        "/usr/local/go/bin/go",       # ручная установка с go.dev/dl
+        os.path.expanduser("~/go/bin/go"),
+        "C:\\Program Files\\Go\\bin\\go.exe",
+        "C:\\Go\\bin\\go.exe",
+    ]
+    for cand in candidates:
+        if os.path.isfile(cand):
+            return cand
+    return None
+
+
+def enhanced_path_env() -> dict:
+    """Среда для subprocess с расширенным PATH — чтобы 'go' и 'brew' нашлись
+    даже когда GUI запущен из .app с урезанным PATH."""
+    env = os.environ.copy()
+    extra = [
+        "/opt/homebrew/bin", "/opt/homebrew/sbin",
+        "/usr/local/bin", "/usr/local/sbin",
+        "/usr/local/go/bin",
+        os.path.expanduser("~/go/bin"),
+    ]
+    cur = env.get("PATH", "")
+    parts = cur.split(os.pathsep) if cur else []
+    for p in extra:
+        if p not in parts and os.path.isdir(p):
+            parts.append(p)
+    env["PATH"] = os.pathsep.join(parts)
+    return env
+
+
 def check_dependencies() -> list:
     """Список ключевых зависимостей с их статусом.
     Возвращает: [{name, ok, detail, fix_label, fix_action}]"""
@@ -82,7 +120,7 @@ def check_dependencies() -> list:
     })
 
     # Go SDK (нужен для пересборки)
-    go_path = shutil.which("go")
+    go_path = find_go_binary()
     deps.append({
         "name": "Go SDK",
         "ok": go_path is not None,
@@ -114,22 +152,22 @@ def go_command() -> list:
     """Return the command list to launch vpn-proxy. Order:
        1. binary next to gui.py (./vpn-proxy or ./vpn-proxy.exe)
        2. mac .app bundle: ../MacOS/vpn-proxy (CI-built universal binary)
-       3. `go run .` fallback if Go SDK is installed (dev mode)
+       3. `go run .` fallback using absolute go path if Go SDK is installed
     """
     if IS_WIN:
         exe = SCRIPT_DIR / "vpn-proxy.exe"
         if exe.exists():
             return [str(exe)]
     else:
-        # 1. Resources/vpn-proxy (sibling of gui.py)
         exe = SCRIPT_DIR / "vpn-proxy"
         if exe.exists():
             return [str(exe)]
-        # 2. .app/Contents/MacOS/vpn-proxy (where CI puts the universal binary)
         macos_exe = SCRIPT_DIR.parent / "MacOS" / "vpn-proxy"
         if macos_exe.exists():
             return [str(macos_exe)]
-    return ["go", "run", "."]
+    # Fall back to "go run ." using absolute path so PATH-less subprocesses still find it
+    go = find_go_binary() or "go"
+    return [go, "run", "."]
 
 
 def fetch_ssconf(url: str) -> dict:
@@ -1466,6 +1504,7 @@ class App(tk.Tk):
         try:
             popen_kwargs = dict(
                 cwd=str(SCRIPT_DIR),
+                env=enhanced_path_env(),  # /opt/homebrew/bin etc. so 'go' & deps are findable
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 bufsize=1,
@@ -1477,7 +1516,14 @@ class App(tk.Tk):
                 popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
             proc = subprocess.Popen(cmd, **popen_kwargs)
         except FileNotFoundError as e:
-            messagebox.showerror("Ошибка", f"Не удалось запустить: {e}\n\nУбедись что vpn-proxy.exe рядом или Go установлен.")
+            messagebox.showerror(
+                "Не получилось запустить vpn-proxy",
+                f"{e}\n\n"
+                "Возможные причины:\n"
+                "  • vpn-proxy бинарник пропал — нажми «⚙ проверка системы» → «Собрать»\n"
+                "  • Go SDK отсутствует — там же кнопка «Установить»\n"
+                "  • Скачай свежий релиз: github.com/AntonZubritski/ZubriTunnel/releases",
+            )
             return None
         threading.Thread(target=self._pump_log, args=(proc,), daemon=True).start()
         self.proxy_addr = addr
@@ -1904,8 +1950,10 @@ class App(tk.Tk):
 
     def _build_thread(self, workdir: str, out: str):
         try:
-            r = subprocess.run(["go", "build", "-o", out, "."],
-                               cwd=workdir, capture_output=True, text=True, timeout=180)
+            go = find_go_binary() or "go"
+            r = subprocess.run([go, "build", "-o", out, "."],
+                               cwd=workdir, env=enhanced_path_env(),
+                               capture_output=True, text=True, timeout=180)
             if r.returncode == 0:
                 self.log_msg(f"vpn-proxy собран: {out}")
                 self.after(0, lambda: messagebox.showinfo("Готово", f"vpn-proxy собран: {out}"))
