@@ -27,10 +27,56 @@ if getattr(sys, "frozen", False):
 else:
     SCRIPT_DIR = Path(__file__).resolve().parent
     BUNDLE_DIR = SCRIPT_DIR
-KEYS_DIR = SCRIPT_DIR / "keys"
 DEFAULT_ADDR = "127.0.0.1:8080"
 IS_WIN = os.name == "nt"
 IS_MAC = sys.platform == "darwin"
+
+
+def _user_data_dir() -> Path:
+    """Per-user, persistent storage for ZubriTunnel — survives .pkg/.exe
+    upgrades that replace the whole app bundle. Locations follow OS conventions:
+       Mac    → ~/Library/Application Support/ZubriTunnel
+       Win    → %APPDATA%\\ZubriTunnel
+       Linux  → ~/.config/ZubriTunnel
+    """
+    if IS_MAC:
+        base = Path.home() / "Library" / "Application Support" / "ZubriTunnel"
+    elif IS_WIN:
+        appdata = os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming")
+        base = Path(appdata) / "ZubriTunnel"
+    else:
+        cfg = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
+        base = Path(cfg) / "ZubriTunnel"
+    base.mkdir(parents=True, exist_ok=True)
+    return base
+
+
+USER_DATA_DIR = _user_data_dir()
+KEYS_DIR = USER_DATA_DIR / "keys"
+
+
+def _migrate_legacy_keys():
+    """Earlier versions stored keys at SCRIPT_DIR/keys (inside the .app/.exe
+    bundle), which get wiped on every upgrade. Copy any leftover JSONs there
+    into the new persistent location once."""
+    legacy = SCRIPT_DIR / "keys"
+    if not legacy.exists() or legacy == KEYS_DIR:
+        return
+    KEYS_DIR.mkdir(parents=True, exist_ok=True)
+    moved = 0
+    for f in legacy.glob("*.json"):
+        target = KEYS_DIR / f.name
+        if not target.exists():
+            try:
+                target.write_bytes(f.read_bytes())
+                moved += 1
+            except Exception:
+                pass
+    if moved:
+        print(f"[ZubriTunnel] migrated {moved} key(s) from {legacy} → {KEYS_DIR}")
+
+
+_migrate_legacy_keys()
 
 
 def bundled_resource(name: str) -> Path:
@@ -795,7 +841,15 @@ class RoundedCard(tk.Frame):
 # ---------- main GUI ----------
 
 APP_NAME = "ZubriTunnel"
-SETTINGS_FILE = SCRIPT_DIR / "settings.json"
+SETTINGS_FILE = USER_DATA_DIR / "settings.json"
+# One-time migration: move settings.json out of the bundle if found
+_legacy_settings = SCRIPT_DIR / "settings.json"
+if _legacy_settings.exists() and not SETTINGS_FILE.exists():
+    try:
+        SETTINGS_FILE.write_bytes(_legacy_settings.read_bytes())
+        print(f"[ZubriTunnel] migrated settings.json → {SETTINGS_FILE}")
+    except Exception:
+        pass
 
 
 def read_app_version() -> str:
