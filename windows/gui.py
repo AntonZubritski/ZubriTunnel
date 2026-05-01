@@ -2186,7 +2186,33 @@ class App(tk.Tk):
             self.show_deps_dialog()
             return
 
-        mode = raw.get("ovpn_mode", "system")  # default for legacy keys
+        # Mode resolution. New keys imported on beta1+ have ovpn_mode set.
+        # Legacy keys (or keys imported before user picked a mode) get asked
+        # ONCE at connect time and the choice is persisted back to the JSON.
+        mode = raw.get("ovpn_mode")
+        if not mode:
+            if IS_MAC:
+                ans = messagebox.askyesno(
+                    "Режим работы .ovpn",
+                    "Этот ключ ещё не настроен. Как использовать?\n\n"
+                    "• Да — per-app: VPN только для приложений, запущенных через ZubriTunnel.\n"
+                    "  Остальная система идёт напрямую.\n\n"
+                    "• Нет — system-wide: весь трафик системы через VPN (как Tunnelblick).\n\n"
+                    "Выбор сохранится — повторно спрашивать не буду."
+                )
+                mode = "per-app" if ans else "system"
+            else:
+                mode = "system"  # Windows: only system-wide for now
+            # Persist choice back to the JSON so we don't re-ask
+            try:
+                raw["ovpn_mode"] = mode
+                k["path"].write_text(
+                    json.dumps(raw, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+                self.log_msg(f"{k['name']}: mode set to {mode} (saved)")
+            except Exception as e:
+                self.log_msg(f"{k['name']}: couldn't save mode: {e}")
         # Per-app mode requires the connection to be split-tunnel; inject
         # pull-filters that reject the server's directives that would
         # commandeer the default route or DNS.
