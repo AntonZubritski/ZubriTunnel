@@ -1520,7 +1520,12 @@ class App(tk.Tk):
         for k in keys:
             p = self.proxies.get(k["name"])
             if p and p["proc"].poll() is None:
-                status = f"●  :{p['addr'].split(':')[1]}"
+                if p.get("type") == "ovpn":
+                    status = "● VPN активен"
+                else:
+                    # Shadowsocks proxy — addr is "127.0.0.1:8080"
+                    parts = p["addr"].rsplit(":", 1)
+                    status = f"●  :{parts[-1]}" if len(parts) == 2 else "● подключён"
             else:
                 status = "○ не подключён"
             self.tree.insert("", "end", iid=k["name"], values=(status, k["name"], k["tag"], k["server"], k["port"]))
