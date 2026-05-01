@@ -3714,33 +3714,37 @@ _first_mouse_imp_keepalive = None  # holds the C trampoline so GC doesn't free i
 def setup_macos_accepts_first_mouse():
     """Fix macOS click-through for inactive windows.
 
-    Default Cocoa behaviour: when an inactive NSWindow is clicked, the click
-    is consumed to ACTIVATE the window — the widget under the cursor doesn't
-    fire. User has to click twice (first to activate, second to act).
+    Default Cocoa: an inactive window eats the first mouse click for
+    activation. Widget under cursor doesn't fire. Standard fix: override
+    `-(BOOL)acceptsFirstMouse:` on the view subclass to return YES.
 
-    Standard fix is to override `-(BOOL)acceptsFirstMouse:(NSEvent*)event` on
-    the window subclass. Tkinter doesn't expose that hook, so we replace the
-    method on NSWindow itself via the Objective-C runtime — every window
-    in the process now accepts the first mouse click immediately.
-
-    No-op on non-Mac. Best-effort on Mac (silent on failure)."""
+    Previous attempts swizzled named classes (NSView, TKContentView).
+    Didn't fully work — Tk creates view subclasses dynamically with names
+    we don't know. NUCLEAR FIX: enumerate every class loaded in the
+    runtime, find ones whose superclass chain includes NSView, and replace
+    acceptsFirstMouse: on each. Catches Tk's runtime classes regardless
+    of name."""
     global _first_mouse_imp_keepalive
     if sys.platform != "darwin":
         return
     try:
         import ctypes, ctypes.util
-        from ctypes import c_void_p, c_char_p, c_bool, CFUNCTYPE
+        from ctypes import c_void_p, c_char_p, c_bool, c_uint, CFUNCTYPE, POINTER, byref
 
         objc_path = ctypes.util.find_library("objc")
         if not objc_path:
             return
         objc = ctypes.cdll.LoadLibrary(objc_path)
-        # Foundation pulls NSWindow's framework chain (AppKit) into the
-        # process so objc_getClass("NSWindow") resolves.
-        try:
-            ctypes.cdll.LoadLibrary("/System/Library/Frameworks/AppKit.framework/AppKit")
-        except OSError:
-            return
+        # Force-load AppKit + Foundation so all NSView/NSWindow descendants
+        # are registered before we enumerate.
+        for fw in (
+            "/System/Library/Frameworks/AppKit.framework/AppKit",
+            "/System/Library/Frameworks/Foundation.framework/Foundation",
+        ):
+            try:
+                ctypes.cdll.LoadLibrary(fw)
+            except OSError:
+                pass
 
         objc.objc_getClass.restype = c_void_p
         objc.objc_getClass.argtypes = [c_char_p]
@@ -3748,10 +3752,15 @@ def setup_macos_accepts_first_mouse():
         objc.sel_registerName.argtypes = [c_char_p]
         objc.class_replaceMethod.restype = c_void_p
         objc.class_replaceMethod.argtypes = [c_void_p, c_void_p, c_void_p, c_char_p]
+        objc.objc_copyClassList.restype = POINTER(c_void_p)
+        objc.objc_copyClassList.argtypes = [POINTER(c_uint)]
+        objc.class_getSuperclass.restype = c_void_p
+        objc.class_getSuperclass.argtypes = [c_void_p]
+        objc.class_getName.restype = c_char_p
+        objc.class_getName.argtypes = [c_void_p]
 
         sel = objc.sel_registerName(b"acceptsFirstMouse:")
-        # Method signature: -(BOOL)acceptsFirstMouse:(NSEvent*)event
-        # Objective-C type encoding: BOOL=c, id=@, SEL=:
+        # -(BOOL)acceptsFirstMouse:(NSEvent*)event — encoding c@:@ on macOS
         IMP_TYPE = CFUNCTYPE(c_bool, c_void_p, c_void_p, c_void_p)
 
         def _impl(self_id, sel_id, event_id):
@@ -3761,16 +3770,50 @@ def setup_macos_accepts_first_mouse():
         # CRITICAL: keep `imp` alive for the lifetime of the process.
         _first_mouse_imp_keepalive = imp
 
-        # The actual click decision happens on the VIEW under the cursor, not
-        # the window — NSWindow's acceptsFirstMouse just delegates to its
-        # contentView's same method. Tk's view subclass is "TKContentView";
-        # we swizzle that AND fall back to NSView/NSWindow/NSPanel for safety.
-        for cls_name in (b"TKContentView", b"NSView", b"NSWindow", b"NSPanel"):
-            cls = objc.objc_getClass(cls_name)
-            if cls:
-                objc.class_replaceMethod(cls, sel, imp, b"c@:@")
+        NSView = objc.objc_getClass(b"NSView")
+        if not NSView:
+            return
+
+        # Pre-swizzle NSWindow + NSPanel directly (window-level deciders)
+        for fixed in (objc.objc_getClass(b"NSWindow"), objc.objc_getClass(b"NSPanel")):
+            if fixed:
+                objc.class_replaceMethod(fixed, sel, imp, b"c@:@")
+
+        # Enumerate every class. Find NSView descendants. Swizzle each.
+        count = c_uint(0)
+        class_list = objc.objc_copyClassList(byref(count))
+        n = count.value
+        swizzled = 0
+        try:
+            for i in range(n):
+                cls = class_list[i]
+                if not cls:
+                    continue
+                cur, hops = cls, 0
+                while cur and hops < 32:
+                    if cur == NSView:
+                        objc.class_replaceMethod(cls, sel, imp, b"c@:@")
+                        swizzled += 1
+                        break
+                    cur = objc.class_getSuperclass(cur)
+                    hops += 1
+        finally:
+            try:
+                libc_path = ctypes.util.find_library("c") or "libc.dylib"
+                libc = ctypes.cdll.LoadLibrary(libc_path)
+                libc.free.argtypes = [c_void_p]
+                libc.free(ctypes.cast(class_list, c_void_p))
+            except Exception:
+                pass
+
+        print(
+            f"[ZubriTunnel] click-through: swizzled acceptsFirstMouse "
+            f"on {swizzled} NSView subclasses",
+            file=sys.stderr,
+        )
     except Exception as e:
-        print(f"[ZubriTunnel] setup_macos_accepts_first_mouse failed: {e}", file=sys.stderr)
+        print(f"[ZubriTunnel] setup_macos_accepts_first_mouse failed: {e}",
+              file=sys.stderr)
 
 
 def setup_macos_app_name(name: str = "ZubriTunnel"):
@@ -3845,10 +3888,16 @@ def setup_macos_app_name(name: str = "ZubriTunnel"):
 def main():
     setup_windows_dpi()
     setup_windows_taskbar_id()
-    setup_macos_accepts_first_mouse()  # fix click-through (must be before window creation)
+    setup_macos_accepts_first_mouse()  # 1st pass — before Tk loads its view classes
     setup_macos_app_name(f"ZubriTunnel v{APP_VERSION}")
     KEYS_DIR.mkdir(exist_ok=True)
     app = App()
+    # 2nd pass — Tk has now created its TKContentView dynamically. Swizzle
+    # again to catch any class that was registered between the 1st pass and now.
+    setup_macos_accepts_first_mouse()
+    # 3rd pass after the window is actually mapped (some Tk classes are
+    # only created when a window is shown).
+    app.after(100, setup_macos_accepts_first_mouse)
     try:
         app.tk.call("tk", "appname", f"ZubriTunnel v{APP_VERSION}")
     except Exception:
