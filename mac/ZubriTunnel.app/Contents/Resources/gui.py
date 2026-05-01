@@ -3582,6 +3582,69 @@ def setup_windows_taskbar_id():
         pass
 
 
+_first_mouse_imp_keepalive = None  # holds the C trampoline so GC doesn't free it
+
+def setup_macos_accepts_first_mouse():
+    """Fix macOS click-through for inactive windows.
+
+    Default Cocoa behaviour: when an inactive NSWindow is clicked, the click
+    is consumed to ACTIVATE the window — the widget under the cursor doesn't
+    fire. User has to click twice (first to activate, second to act).
+
+    Standard fix is to override `-(BOOL)acceptsFirstMouse:(NSEvent*)event` on
+    the window subclass. Tkinter doesn't expose that hook, so we replace the
+    method on NSWindow itself via the Objective-C runtime — every window
+    in the process now accepts the first mouse click immediately.
+
+    No-op on non-Mac. Best-effort on Mac (silent on failure)."""
+    global _first_mouse_imp_keepalive
+    if sys.platform != "darwin":
+        return
+    try:
+        import ctypes, ctypes.util
+        from ctypes import c_void_p, c_char_p, c_bool, CFUNCTYPE
+
+        objc_path = ctypes.util.find_library("objc")
+        if not objc_path:
+            return
+        objc = ctypes.cdll.LoadLibrary(objc_path)
+        # Foundation pulls NSWindow's framework chain (AppKit) into the
+        # process so objc_getClass("NSWindow") resolves.
+        try:
+            ctypes.cdll.LoadLibrary("/System/Library/Frameworks/AppKit.framework/AppKit")
+        except OSError:
+            return
+
+        objc.objc_getClass.restype = c_void_p
+        objc.objc_getClass.argtypes = [c_char_p]
+        objc.sel_registerName.restype = c_void_p
+        objc.sel_registerName.argtypes = [c_char_p]
+        objc.class_replaceMethod.restype = c_void_p
+        objc.class_replaceMethod.argtypes = [c_void_p, c_void_p, c_void_p, c_char_p]
+
+        NSWindow = objc.objc_getClass(b"NSWindow")
+        if not NSWindow:
+            return
+        sel = objc.sel_registerName(b"acceptsFirstMouse:")
+
+        # Method signature: -(BOOL)acceptsFirstMouse:(NSEvent*)event
+        # Objective-C type encoding: BOOL is `c` (signed char) on macOS.
+        IMP_TYPE = CFUNCTYPE(c_bool, c_void_p, c_void_p, c_void_p)
+
+        def _impl(self_id, sel_id, event_id):
+            return True
+
+        imp = IMP_TYPE(_impl)
+        # CRITICAL: keep `imp` alive for the lifetime of the process. If the
+        # CFUNCTYPE wrapper is GC'd, the trampoline page is freed and the
+        # next click crashes the app with EXC_BAD_ACCESS.
+        _first_mouse_imp_keepalive = imp
+
+        objc.class_replaceMethod(NSWindow, sel, imp, b"c@:@")
+    except Exception as e:
+        print(f"[ZubriTunnel] setup_macos_accepts_first_mouse failed: {e}", file=sys.stderr)
+
+
 def setup_macos_app_name(name: str = "ZubriTunnel"):
     """Override macOS process / menu-bar / dock display name from 'Python' to
     our app name. Uses libobjc (no PyObjC dep needed). Best-effort — silently
@@ -3654,6 +3717,7 @@ def setup_macos_app_name(name: str = "ZubriTunnel"):
 def main():
     setup_windows_dpi()
     setup_windows_taskbar_id()
+    setup_macos_accepts_first_mouse()  # fix click-through (must be before window creation)
     setup_macos_app_name(f"ZubriTunnel v{APP_VERSION}")
     KEYS_DIR.mkdir(exist_ok=True)
     app = App()
