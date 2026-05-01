@@ -2265,6 +2265,80 @@ class App(tk.Tk):
         # Watch the log for utun + "Initialization Sequence Completed"
         threading.Thread(target=self._wait_ovpn_ready, args=(k, log_path), daemon=True).start()
 
+    def _mac_install_scoped_default(self, iface: str):
+        """Install a scoped default route via the OpenVPN utun.
+
+        WHY: in split-tunnel mode the system default route stays on the
+        physical interface. When the bridge does IP_BOUND_IF=utunX on its
+        outbound socket, the kernel scopes the route lookup to utunX — and
+        finds nothing for arbitrary destinations → ENETUNREACH.
+
+        FIX: `route add -ifscope utunX default <peer>` adds a default route
+        SCOPED to utunX only. Sockets bound to utunX find this route and use
+        the tunnel; sockets without IP_BOUND_IF continue with the regular
+        global default route, untouched.
+
+        Needs root → osascript with administrator privileges. Cleanup: when
+        utunX is destroyed (we destroy it on disconnect), the scoped route
+        evaporates with it, no manual `route delete` needed."""
+        if not IS_MAC:
+            return
+        # Find the utun's peer address from ifconfig
+        try:
+            r = subprocess.run(
+                ["ifconfig", iface],
+                capture_output=True, text=True, timeout=5,
+            )
+        except Exception as e:
+            self.log_msg(f"ifconfig {iface} failed: {e}")
+            return
+        peer = None
+        for line in r.stdout.splitlines():
+            line = line.strip()
+            # `inet 10.8.0.5 --> 10.8.0.1 netmask 0xffffffff`
+            if line.startswith("inet ") and "-->" in line:
+                parts = line.split()
+                try:
+                    arrow_idx = parts.index("-->")
+                    peer = parts[arrow_idx + 1]
+                    break
+                except (ValueError, IndexError):
+                    pass
+        if not peer:
+            self.log_msg(f"⚠ не нашёл peer-адрес для {iface} в ifconfig — bridge route не установлен")
+            self.log_msg(f"  ifconfig output:\n{r.stdout.strip()[:300]}")
+            return
+        self.log_msg(f"добавляю scoped default route: {iface} → {peer}")
+        # Run route add via elevation. Re-uses same osascript path.
+        sh = (
+            f"route -n add -ifscope {iface} default {peer} 2>&1 "
+            f"|| route -n change -ifscope {iface} default {peer} 2>&1\n"
+            "exit 0\n"
+        )
+        import tempfile
+        f = tempfile.NamedTemporaryFile(
+            "w", suffix=".sh", delete=False, prefix="zubri-route-",
+        )
+        f.write("#!/bin/bash\n" + sh)
+        f.close()
+        os.chmod(f.name, 0o755)
+        applescript = (
+            f'do shell script "/bin/bash {shlex.quote(f.name)}" '
+            f'with administrator privileges '
+            f'with prompt "ZubriTunnel настраивает per-app маршрут"'
+        )
+        try:
+            subprocess.run(
+                ["osascript", "-e", applescript],
+                capture_output=True, text=True, timeout=30,
+            )
+            self.log_msg(f"✓ scoped route установлен: -ifscope {iface} default {peer}")
+        except Exception as e:
+            self.log_msg(f"scoped route failed: {e}")
+        finally:
+            try: os.unlink(f.name)
+            except OSError: pass
+
     def _start_ovpn_bridge(self, key_name: str, iface: str, addr: str):
         """Spawn vpn-proxy in -bridge-iface mode. Call this only AFTER openvpn
         has reported its utun device — the bridge needs the iface to exist.
@@ -2452,9 +2526,15 @@ class App(tk.Tk):
                             mode = entry.get("ovpn_mode", "system")
                             our_utun = self._our_utuns.get(k["name"])
                             if mode == "per-app" and our_utun:
-                                # Start the local bridge — without it apps
-                                # have no way to reach the VPN tunnel.
+                                # Add a scoped default route via utun:
+                                # `route add -ifscope utunN default <peer>`.
+                                # Without it, sockets bound via IP_BOUND_IF
+                                # have no route → ENETUNREACH. Scoped means
+                                # ONLY sockets bound to utunN see this route;
+                                # everything else continues using the regular
+                                # default. Needs sudo (folded into bridge start).
                                 bridge_addr = entry.get("bridge_addr")
+                                self.after(0, lambda u=our_utun: self._mac_install_scoped_default(u))
                                 self.after(0, lambda: self._start_ovpn_bridge(
                                     k["name"], our_utun, bridge_addr,
                                 ))
@@ -3648,25 +3728,26 @@ def setup_macos_accepts_first_mouse():
         objc.class_replaceMethod.restype = c_void_p
         objc.class_replaceMethod.argtypes = [c_void_p, c_void_p, c_void_p, c_char_p]
 
-        NSWindow = objc.objc_getClass(b"NSWindow")
-        if not NSWindow:
-            return
         sel = objc.sel_registerName(b"acceptsFirstMouse:")
-
         # Method signature: -(BOOL)acceptsFirstMouse:(NSEvent*)event
-        # Objective-C type encoding: BOOL is `c` (signed char) on macOS.
+        # Objective-C type encoding: BOOL=c, id=@, SEL=:
         IMP_TYPE = CFUNCTYPE(c_bool, c_void_p, c_void_p, c_void_p)
 
         def _impl(self_id, sel_id, event_id):
             return True
 
         imp = IMP_TYPE(_impl)
-        # CRITICAL: keep `imp` alive for the lifetime of the process. If the
-        # CFUNCTYPE wrapper is GC'd, the trampoline page is freed and the
-        # next click crashes the app with EXC_BAD_ACCESS.
+        # CRITICAL: keep `imp` alive for the lifetime of the process.
         _first_mouse_imp_keepalive = imp
 
-        objc.class_replaceMethod(NSWindow, sel, imp, b"c@:@")
+        # The actual click decision happens on the VIEW under the cursor, not
+        # the window — NSWindow's acceptsFirstMouse just delegates to its
+        # contentView's same method. Tk's view subclass is "TKContentView";
+        # we swizzle that AND fall back to NSView/NSWindow/NSPanel for safety.
+        for cls_name in (b"TKContentView", b"NSView", b"NSWindow", b"NSPanel"):
+            cls = objc.objc_getClass(cls_name)
+            if cls:
+                objc.class_replaceMethod(cls, sel, imp, b"c@:@")
     except Exception as e:
         print(f"[ZubriTunnel] setup_macos_accepts_first_mouse failed: {e}", file=sys.stderr)
 
