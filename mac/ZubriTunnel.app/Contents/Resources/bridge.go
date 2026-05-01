@@ -23,6 +23,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/http/httputil"
 	"net/url"
 	"os"
 	"os/signal"
@@ -169,35 +170,30 @@ func handleConnect(w http.ResponseWriter, r *http.Request, dialer *net.Dialer) {
 // handlePlainProxy serves plain (non-CONNECT) HTTP proxy requests — i.e. the
 // client sends "GET http://example.com/foo HTTP/1.1" with absolute URL, we
 // fetch it via our pinned transport and stream the response back.
+//
+// Implementation uses httputil.ReverseProxy because it correctly handles all
+// the edge cases that a hand-rolled Clone+RoundTrip misses (HTTP/1.1 chunked
+// responses, hijacked connections, request trailers, gzip negotiation, etc.).
 func handlePlainProxy(w http.ResponseWriter, r *http.Request, transport *http.Transport) {
-	// Reject obvious bad requests fast
 	if !r.URL.IsAbs() {
 		http.Error(w, "this is a proxy — request URL must be absolute", http.StatusBadRequest)
 		return
 	}
-
-	// Build outbound request, dropping hop-by-hop headers that must not be forwarded
-	out := r.Clone(r.Context())
-	out.RequestURI = ""
-	stripHopHeaders(out.Header)
-
-	// Send via our pinned transport
-	resp, err := transport.RoundTrip(out)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadGateway)
-		log.Printf("bridge: %s %s failed: %v", r.Method, r.URL, err)
-		return
+	proxy := &httputil.ReverseProxy{
+		Director: func(req *http.Request) {
+			// req.URL is already the absolute URL the client sent. Just
+			// strip hop-by-hop headers and ensure Host is set.
+			stripHopHeaders(req.Header)
+			req.Host = req.URL.Host
+		},
+		Transport: transport,
+		ErrorHandler: func(rw http.ResponseWriter, req *http.Request, err error) {
+			log.Printf("bridge: %s %s failed: %v", req.Method, req.URL, err)
+			rw.WriteHeader(http.StatusBadGateway)
+			_, _ = rw.Write([]byte("bridge: " + err.Error()))
+		},
 	}
-	defer resp.Body.Close()
-
-	stripHopHeaders(resp.Header)
-	for k, vs := range resp.Header {
-		for _, v := range vs {
-			w.Header().Add(k, v)
-		}
-	}
-	w.WriteHeader(resp.StatusCode)
-	_, _ = io.Copy(w, resp.Body)
+	proxy.ServeHTTP(w, r)
 }
 
 func stripHopHeaders(h http.Header) {

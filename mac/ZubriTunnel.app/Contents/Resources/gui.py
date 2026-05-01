@@ -2309,10 +2309,24 @@ class App(tk.Tk):
             self.log_msg(f"  ifconfig output:\n{r.stdout.strip()[:300]}")
             return
         self.log_msg(f"добавляю scoped default route: {iface} → {peer}")
-        # Run route add via elevation. Re-uses same osascript path.
+        # Aggressive cleanup of any default-route hijacks that openvpn might
+        # have set DESPITE our pull-filter. OpenVPN's --redirect-gateway
+        # normally installs two /1 routes (0.0.0.0/1 and 128.0.0.0/1) which
+        # are more specific than the /0 default → all traffic goes via utun.
+        # We delete those, plus any non-scoped default that points to utun.
+        # This ensures system traffic stays on the physical interface and
+        # ONLY sockets bound via IP_BOUND_IF use our scoped default.
         sh = (
+            f"# Remove openvpn's default-route hijacks (if any)\n"
+            f"route -n delete -inet 0.0.0.0/1 -interface {iface} 2>/dev/null || true\n"
+            f"route -n delete -inet 128.0.0.0/1 -interface {iface} 2>/dev/null || true\n"
+            f"route -n delete -inet default -interface {iface} 2>/dev/null || true\n"
+            # Now install our scoped default — only sockets bound to utunN see it
             f"route -n add -ifscope {iface} default {peer} 2>&1 "
             f"|| route -n change -ifscope {iface} default {peer} 2>&1\n"
+            f"# Show final routing table for debugging\n"
+            f"echo '--- final default routes ---'\n"
+            f"netstat -rn -f inet | grep -E '^(default|0\\.0\\.0\\.0|128\\.0\\.0\\.0)' || true\n"
             "exit 0\n"
         )
         import tempfile
@@ -2328,11 +2342,18 @@ class App(tk.Tk):
             f'with prompt "ZubriTunnel настраивает per-app маршрут"'
         )
         try:
-            subprocess.run(
+            r = subprocess.run(
                 ["osascript", "-e", applescript],
                 capture_output=True, text=True, timeout=30,
             )
-            self.log_msg(f"✓ scoped route установлен: -ifscope {iface} default {peer}")
+            # Log script stdout/stderr for visibility — incl. final routes
+            if r.stdout.strip():
+                for ln in r.stdout.strip().splitlines():
+                    self.log_msg(f"  route: {ln}")
+            if r.stderr.strip() and "User canceled" not in r.stderr:
+                for ln in r.stderr.strip().splitlines():
+                    self.log_msg(f"  route stderr: {ln}")
+            self.log_msg(f"✓ scoped route обновлён: -ifscope {iface} default {peer}")
         except Exception as e:
             self.log_msg(f"scoped route failed: {e}")
         finally:
