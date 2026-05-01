@@ -652,7 +652,8 @@ class RoundButton(tk.Canvas):
             parent_bg = parent.cget("bg")
         except tk.TclError:
             parent_bg = COLORS["bg"]
-        super().__init__(parent, highlightthickness=0, bd=0, bg=parent_bg, **kw)
+        super().__init__(parent, highlightthickness=0, bd=0, bg=parent_bg,
+                         cursor="hand2", **kw)
         self._sync_size(width)
 
         self.bind("<Enter>", self._on_enter)
@@ -753,6 +754,11 @@ class RoundButton(tk.Canvas):
     def set_state(self, state: str):
         self._enabled = (state == "normal")
         self._state = "normal" if self._enabled else "disabled"
+        # Cursor: hand only when clickable; default arrow when disabled
+        try:
+            self.configure(cursor="hand2" if self._enabled else "")
+        except tk.TclError:
+            pass
         self._draw()
 
 
@@ -1399,6 +1405,14 @@ class App(tk.Tk):
         self.status_text = tk.Label(bar_pad, text="выбери ключ", anchor="w",
                                     bg=COLORS["panel"], fg=COLORS["text"], font=UI_FONT)
         self.status_text.pack(side="left", padx=10, fill="x", expand=True)
+        # Busy indicator — animated when long operations are running
+        self._busy_label = tk.Label(bar_pad, text="", bg=COLORS["panel"],
+                                     fg=COLORS["accent"], font=UI_FONT_BOLD)
+        self._busy_label.pack(side="right", padx=10)
+        self._busy_active = False
+        self._busy_message = ""
+        self._busy_phase = 0
+        self._busy_spinner = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 
         # Keys card
         kf = self._rounded_card(outer, title="Ключи")
@@ -1576,14 +1590,20 @@ class App(tk.Tk):
         if not url:
             return
         url = url.strip()
+        self.show_busy("загружаю конфиг с сервера")
+        threading.Thread(target=self._add_ssconf_thread, args=(url,), daemon=True).start()
+
+    def _add_ssconf_thread(self, url: str):
         try:
             data = fetch_ssconf(url)
         except Exception as e:
-            messagebox.showerror("Ошибка", f"Не удалось скачать: {e}")
+            self.hide_busy()
+            self.after(0, lambda: messagebox.showerror("Ошибка", f"Не удалось скачать: {e}"))
             return
+        self.hide_busy()
         data["_ssconf_url"] = url
         default = data.get("tag") or url.rstrip("/").split("/")[-1] or "ssconf"
-        self._save_key(data, default)
+        self.after(0, lambda: self._save_key(data, default))
 
     def _ask_string_with_paste(self, title: str, prompt: str, initial: str = "") -> str | None:
         """Custom replacement for simpledialog.askstring with a paste button.
@@ -1840,14 +1860,17 @@ class App(tk.Tk):
             raw["_ssconf_url"] = ssconf_url
             k["path"].write_text(json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8")
 
+        self.show_busy("загружаю список регионов")
         threading.Thread(target=self._open_region_dialog, args=(k, ssconf_url), daemon=True).start()
 
     def _open_region_dialog(self, k: dict, ssconf_url: str):
         try:
             locations = fetch_provider_locations(ssconf_url)
         except Exception as e:
+            self.hide_busy()
             self.after(0, lambda: messagebox.showerror("Регионы", f"Не удалось получить список:\n{e}"))
             return
+        self.hide_busy()
         # filter out systemLocation entries
         visible = [loc for loc in locations if not loc.get("systemLocation")]
         if not visible:
@@ -1974,6 +1997,45 @@ class App(tk.Tk):
 
     def _on_select_key(self):
         self._update_status_display()
+
+    def show_busy(self, message: str):
+        """Show animated spinner with `message` in the status bar.
+        Call hide_busy() when the operation is done. Safe to call from any
+        thread — internally schedules animation on the main loop."""
+        def _start():
+            self._busy_message = message
+            self._busy_phase = 0
+            if not self._busy_active:
+                self._busy_active = True
+                self._animate_busy()
+        try:
+            self.after(0, _start)
+        except RuntimeError:
+            pass
+
+    def hide_busy(self):
+        """Stop the spinner animation and clear the message. Thread-safe."""
+        def _stop():
+            self._busy_active = False
+            try:
+                self._busy_label.configure(text="")
+            except Exception:
+                pass
+        try:
+            self.after(0, _stop)
+        except RuntimeError:
+            pass
+
+    def _animate_busy(self):
+        if not self._busy_active:
+            return
+        spinner = self._busy_spinner[self._busy_phase % len(self._busy_spinner)]
+        try:
+            self._busy_label.configure(text=f"{spinner}  {self._busy_message}")
+        except Exception:
+            pass
+        self._busy_phase += 1
+        self.after(120, self._animate_busy)
 
     def _update_status_display(self):
         sel = self.selected_key()
@@ -2113,6 +2175,7 @@ class App(tk.Tk):
         }
         self.log_msg(f"{k['name']}: OpenVPN запущен (system-wide). Лог: {log_path}")
         self._update_status_display()
+        self.show_busy(f"поднимаю VPN-тоннель ({k['name']})")
         # Watch the log for "Initialization Sequence Completed"
         threading.Thread(target=self._wait_ovpn_ready, args=(k, log_path), daemon=True).start()
 
@@ -2225,6 +2288,7 @@ class App(tk.Tk):
                     self.log_msg(f"{k['name']}: {full}")
                     self.after(0, lambda m=full: messagebox.showerror("OpenVPN — сбой", m))
                 # Cleanup ghost proxy entry
+                self.hide_busy()
                 self.proxies.pop(k["name"], None)
                 self.after(0, lambda: (self._update_status_display(), self.refresh_keys()))
                 # Failed openvpn might have allocated a utun before crashing.
@@ -2262,6 +2326,7 @@ class App(tk.Tk):
                                 self._our_utuns[k["name"]] = m.group(1)
                                 self.log_msg(f"{k['name']}: TUN device = {m.group(1)}")
                         if "Initialization Sequence Completed" in text:
+                            self.hide_busy()
                             self.after(0, lambda: (
                                 self.log_msg(f"{k['name']}: ✓ VPN tunnel up — system-wide"),
                                 self._update_status_display(),
@@ -2269,11 +2334,13 @@ class App(tk.Tk):
                             ))
                             return
                         if "AUTH_FAILED" in text:
+                            self.hide_busy()
                             self.after(0, lambda: messagebox.showerror(
                                 "OpenVPN: auth failed",
                                 "Сервер отклонил аутентификацию. Проверь логин/пароль или сертификат в .ovpn."))
                             return
                         if "Cannot allocate TUN" in text or "TUN_ERROR" in text:
+                            self.hide_busy()
                             self.after(0, lambda: messagebox.showerror(
                                 "OpenVPN: TUN error",
                                 "Не получилось создать сетевой интерфейс. Проверь что нет конфликтующих VPN-клиентов."))
@@ -2281,6 +2348,7 @@ class App(tk.Tk):
             except Exception:
                 pass
             _t.sleep(1.0)
+        self.hide_busy()
         self.log_msg(f"{k['name']}: timeout 60s — see {log_path}")
         # Emit tail of log so user sees what was happening
         try:
@@ -2768,6 +2836,7 @@ class App(tk.Tk):
                 return
             host_port = active["addr"]
         self.log_msg(f"системный прокси: {'применяю настройки…' if on else 'выключаю…'}")
+        self.show_busy("применяю настройки сети")
         threading.Thread(
             target=self._toggle_system_proxy_thread,
             args=(on, host_port),
@@ -2776,6 +2845,7 @@ class App(tk.Tk):
 
     def _toggle_system_proxy_thread(self, on: bool, host_port: str | None):
         ok, msg = system_proxy_set(host_port if on else None)
+        self.hide_busy()
         def _show():
             if ok:
                 self._system_proxy_active = host_port if on else None
