@@ -39,7 +39,18 @@ func main() {
 	addr := flag.String("addr", "127.0.0.1:8080", "local HTTP proxy address")
 	launch := flag.String("launch", "", "what to start: code | bash | terminal | <path>. Empty = interactive menu")
 	noMenu := flag.Bool("no-menu", false, "skip menu, just run proxy")
+	bridgeIface := flag.String("bridge-iface", "", "Mac per-app mode: route outbound TCP through this interface (e.g. utun6 from OpenVPN). Skips Shadowsocks; ignores -key/-ssconf.")
 	flag.Parse()
+
+	// Per-app OpenVPN bridge mode — fundamentally different code path.
+	// Doesn't touch Shadowsocks, doesn't read keys/, just runs an HTTP CONNECT
+	// proxy that pins outbound sockets to a TUN device via IP_BOUND_IF.
+	if *bridgeIface != "" {
+		if err := runBridgeMode(*bridgeIface, *addr); err != nil {
+			log.Fatalf("bridge: %v", err)
+		}
+		return
+	}
 
 	key, source, err := selectKey(*configPath, *ssconfURL, *keyName, *keysDir)
 	if err != nil {

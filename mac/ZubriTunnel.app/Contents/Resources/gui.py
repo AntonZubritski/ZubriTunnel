@@ -1686,7 +1686,9 @@ class App(tk.Tk):
         self._save_key(data, data.get("tag") or Path(f).stem)
 
     def add_ovpn_file(self):
-        """Импорт .ovpn файла. Сохраняем сырой конфиг + парсим server/port для отображения."""
+        """Импорт .ovpn файла. Сохраняем сырой конфиг + парсим server/port для отображения.
+        В beta-сборке по умолчанию режим per-app (split-tunnel + локальный bridge),
+        чтобы ovpn не захватывал весь системный трафик."""
         f = filedialog.askopenfilename(
             title="OpenVPN config (.ovpn)",
             filetypes=[("OpenVPN", "*.ovpn"), ("All", "*.*")],
@@ -1702,10 +1704,24 @@ class App(tk.Tk):
         if meta["server"] == "?":
             messagebox.showerror("Не похоже на .ovpn", "В файле нет строки 'remote <host> <port>'.")
             return
+        # Спросить юзера: per-app или system-wide
+        mode = "per-app"
+        if IS_MAC:
+            ans = messagebox.askyesno(
+                "Режим работы .ovpn",
+                "Как использовать этот VPN-ключ?\n\n"
+                "• Да — per-app: VPN только для приложений, запущенных через ZubriTunnel "
+                "(VSCode/Chrome/etc.). Остальная система идёт напрямую.\n\n"
+                "• Нет — system-wide: весь трафик системы заворачивается в VPN, "
+                "как Tunnelblick.\n\n"
+                "Рекомендую «Да» — гибче, не ломает остальные приложения."
+            )
+            mode = "per-app" if ans else "system"
         # Сохраняем как наш JSON-ключ с type=ovpn и сырым конфигом внутри.
         data = dict(meta)
         data["tag"] = data.get("tag") or Path(f).stem
         data["ovpn_config"] = text  # raw text, will be re-written to tmp on connect
+        data["ovpn_mode"] = mode    # "per-app" → split-tunnel + local bridge; "system" → full-tunnel
         self._save_key(data, Path(f).stem)
         # Подсказка про OpenVPN-клиент
         if not find_openvpn_binary():
@@ -2138,10 +2154,20 @@ class App(tk.Tk):
         threading.Thread(target=self._wait_listening, args=(proc, k, addr), daemon=True).start()
 
     def _connect_ovpn(self, k: dict, raw: dict):
-        """Connect via OpenVPN — system-wide tunnel.
-        Currently spawns the OS's installed openvpn binary with elevation
-        (UAC on Windows, sudo prompt on macOS). The connection covers ALL
-        system traffic — per-app routing buttons are no-ops while ovpn is up."""
+        """Connect via OpenVPN. Two modes (decided at import time):
+          - "system":  full-tunnel; all system traffic goes through VPN.
+          - "per-app": split-tunnel + local TCP bridge; only apps launched
+                       via ZubriTunnel use the VPN, rest of the system stays
+                       on the regular default route.
+
+        For per-app mode we:
+          1. Inject pull-filter directives into the .ovpn config so the
+             server can't override default route or DNS.
+          2. Spawn openvpn elevated. Once it reports its utunN device
+             (parsed from the log), we start vpn-proxy in -bridge-iface
+             mode listening on 127.0.0.1:<free port>.
+          3. App-launch buttons (VSCode/Chrome/etc.) point to that port.
+        """
         ovpn_text = raw.get("ovpn_config")
         if not ovpn_text:
             messagebox.showerror("Битый ключ",
@@ -2149,8 +2175,6 @@ class App(tk.Tk):
             return
         ovpn_bin = find_openvpn_binary()
         if not ovpn_bin:
-            # Открываем "Системные зависимости" — там ровно строка OpenVPN
-            # с кнопкой «Установить», вместо тупикового messagebox.
             self.log_msg(
                 f"{k['name']}: OpenVPN не найден — открываю «Системные зависимости»"
             )
@@ -2162,7 +2186,20 @@ class App(tk.Tk):
             self.show_deps_dialog()
             return
 
-        # Write the ovpn config to a temp file so we can pass --config <path>
+        mode = raw.get("ovpn_mode", "system")  # default for legacy keys
+        # Per-app mode requires the connection to be split-tunnel; inject
+        # pull-filters that reject the server's directives that would
+        # commandeer the default route or DNS.
+        if mode == "per-app":
+            patched_lines = [
+                "# ZubriTunnel: per-app mode — keep system default route untouched",
+                'pull-filter ignore "redirect-gateway"',
+                'pull-filter ignore "dhcp-option DNS"',
+                'pull-filter ignore "redirect-private"',
+                "",
+            ]
+            ovpn_text = "\n".join(patched_lines) + ovpn_text
+
         import tempfile
         tmp = tempfile.NamedTemporaryFile(
             mode="w", suffix=".ovpn", delete=False, encoding="utf-8",
@@ -2178,15 +2215,64 @@ class App(tk.Tk):
             try: os.unlink(cfg_path)
             except OSError: pass
             return
+        # Pick a local port for the bridge ahead of time so the entry is
+        # complete before _wait_ovpn_ready needs it.
+        bridge_addr = None
+        if mode == "per-app":
+            bridge_port = find_free_port("127.0.0.1", 8081, avoid=self._used_local_ports())
+            bridge_addr = f"127.0.0.1:{bridge_port}"
         self.proxies[k["name"]] = {
-            "proc": proc, "addr": "system-wide", "key_tag": k["tag"] or k["name"],
-            "type": "ovpn", "config_path": cfg_path, "log_path": log_path,
+            "proc": proc,
+            "addr": bridge_addr or "system-wide",
+            "key_tag": k["tag"] or k["name"],
+            "type": "ovpn",
+            "ovpn_mode": mode,
+            "config_path": cfg_path,
+            "log_path": log_path,
+            "bridge_proc": None,    # filled in once openvpn brings up its utun
+            "bridge_addr": bridge_addr,
         }
-        self.log_msg(f"{k['name']}: OpenVPN запущен (system-wide). Лог: {log_path}")
+        suffix = "per-app" if mode == "per-app" else "system-wide"
+        self.log_msg(f"{k['name']}: OpenVPN запущен ({suffix}). Лог: {log_path}")
         self._update_status_display()
         self.show_busy(f"поднимаю VPN-тоннель ({k['name']})")
-        # Watch the log for "Initialization Sequence Completed"
+        # Watch the log for utun + "Initialization Sequence Completed"
         threading.Thread(target=self._wait_ovpn_ready, args=(k, log_path), daemon=True).start()
+
+    def _start_ovpn_bridge(self, key_name: str, iface: str, addr: str):
+        """Spawn vpn-proxy in -bridge-iface mode. Call this only AFTER openvpn
+        has reported its utun device — the bridge needs the iface to exist.
+        Stores the proc handle in self.proxies[key_name]['bridge_proc'] so
+        _stop_ovpn() can kill it cleanly."""
+        cmd = go_command() + [
+            "-bridge-iface", iface,
+            "-addr", addr,
+        ]
+        self.log_msg(f"$ {' '.join(cmd)}")
+        try:
+            popen_kwargs = dict(
+                cwd=str(SCRIPT_DIR),
+                env=enhanced_path_env(),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                bufsize=1, text=True, encoding="utf-8", errors="replace",
+            )
+            if IS_WIN:
+                popen_kwargs["creationflags"] = (
+                    subprocess.CREATE_NEW_PROCESS_GROUP | WIN_NO_WINDOW
+                )
+            proc = subprocess.Popen(cmd, **popen_kwargs)
+        except Exception as e:
+            self.log_msg(f"{key_name}: bridge start failed: {e}")
+            return
+        if IS_WIN:
+            try: self.win_job.assign(proc)
+            except Exception: pass
+        threading.Thread(target=self._pump_log, args=(proc,), daemon=True).start()
+        # Stash on the proxy entry so we can stop it later
+        entry = self.proxies.get(key_name)
+        if entry is not None:
+            entry["bridge_proc"] = proc
 
     def _spawn_ovpn(self, ovpn_bin: str, cfg_path: str, log_path: str):
         """Запустить openvpn с elevation. На Windows — UAC через PowerShell.
@@ -2336,11 +2422,30 @@ class App(tk.Tk):
                                 self.log_msg(f"{k['name']}: TUN device = {m.group(1)}")
                         if "Initialization Sequence Completed" in text:
                             self.hide_busy()
-                            self.after(0, lambda: (
-                                self.log_msg(f"{k['name']}: ✓ VPN tunnel up — system-wide"),
-                                self._update_status_display(),
-                                self.refresh_keys(),
-                            ))
+                            entry = self.proxies.get(k["name"], {})
+                            mode = entry.get("ovpn_mode", "system")
+                            our_utun = self._our_utuns.get(k["name"])
+                            if mode == "per-app" and our_utun:
+                                # Start the local bridge — without it apps
+                                # have no way to reach the VPN tunnel.
+                                bridge_addr = entry.get("bridge_addr")
+                                self.after(0, lambda: self._start_ovpn_bridge(
+                                    k["name"], our_utun, bridge_addr,
+                                ))
+                                self.after(0, lambda: (
+                                    self.log_msg(
+                                        f"{k['name']}: ✓ VPN tunnel up — per-app via "
+                                        f"{bridge_addr} (utun={our_utun})"
+                                    ),
+                                    self._update_status_display(),
+                                    self.refresh_keys(),
+                                ))
+                            else:
+                                self.after(0, lambda: (
+                                    self.log_msg(f"{k['name']}: ✓ VPN tunnel up — system-wide"),
+                                    self._update_status_display(),
+                                    self.refresh_keys(),
+                                ))
                             return
                         if "AUTH_FAILED" in text:
                             self.hide_busy()
@@ -2471,14 +2576,26 @@ class App(tk.Tk):
         self.refresh_keys()
 
     def _stop_ovpn(self, p: dict):
-        """Kill the elevated openvpn process AND clean up everything it left
-        behind (stale utun interfaces + IPv6 default routes pointing through
-        them) — otherwise multiple failed connect attempts pile up dead utuns
-        that hijack the system's default route and break internet.
+        """Stop the OpenVPN tunnel AND its associated per-app bridge (if any).
+        Order matters: kill the bridge first (regular user process) so apps
+        get a fast connection-refused, THEN kill openvpn (root, via osascript).
 
-        On Mac one elevated osascript prompt covers kill + route flush + utun
-        destroy. On Windows the OpenVPN community client cleans up its own
-        TAP/Wintun interface, so just taskkill is enough."""
+        On Mac one elevated osascript prompt covers openvpn kill + route flush
+        + utun destroy. On Windows the OpenVPN community client cleans up its
+        own TAP/Wintun, so just taskkill is enough."""
+        # Kill the per-app bridge first (no elevation needed)
+        bridge_proc = p.get("bridge_proc")
+        if bridge_proc is not None:
+            try:
+                if bridge_proc.poll() is None:
+                    bridge_proc.terminate()
+                    try: bridge_proc.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        bridge_proc.kill()
+                self.log_msg("OpenVPN bridge остановлен")
+            except Exception as e:
+                self.log_msg(f"bridge stop: {e}")
+
         cfg_path = p.get("config_path")
         log_path = p.get("log_path")
         if IS_WIN:
@@ -2588,8 +2705,23 @@ class App(tk.Tk):
     def _poll_procs(self):
         died = [name for name, p in self.proxies.items() if p["proc"].poll() is not None]
         for name in died:
-            code = self.proxies[name]["proc"].returncode
+            entry = self.proxies[name]
+            code = entry["proc"].returncode
             self.log_msg(f"{name}: proxy exited (code {code})")
+            # If this was a per-app ovpn whose openvpn just died, the local
+            # bridge is now orphaned (still listening but going nowhere). Kill
+            # it so the port frees up for the next attempt.
+            bridge_proc = entry.get("bridge_proc")
+            if bridge_proc is not None:
+                try:
+                    if bridge_proc.poll() is None:
+                        bridge_proc.terminate()
+                        try: bridge_proc.wait(timeout=2)
+                        except subprocess.TimeoutExpired:
+                            bridge_proc.kill()
+                    self.log_msg(f"{name}: bridge killed (parent ovpn died)")
+                except Exception:
+                    pass
             self.proxies.pop(name, None)
         if died:
             self.refresh_keys()
@@ -3538,12 +3670,16 @@ def main():
                 system_proxy_set(None)
             except Exception:
                 pass
-        # Kill any remaining vpn-proxy subprocesses
+        # Kill any remaining vpn-proxy subprocesses (incl. per-app ovpn bridges)
         for name in list(app.proxies.keys()):
             try:
-                p = app.proxies.get(name)
-                if p and p.get("proc") and p["proc"].poll() is None:
-                    p["proc"].kill()
+                p = app.proxies.get(name) or {}
+                bp = p.get("bridge_proc")
+                if bp is not None and bp.poll() is None:
+                    bp.kill()
+                proc = p.get("proc")
+                if proc is not None and proc.poll() is None:
+                    proc.kill()
             except Exception:
                 pass
     atexit.register(_cleanup_on_exit)
