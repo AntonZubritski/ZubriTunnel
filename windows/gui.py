@@ -2756,7 +2756,10 @@ class App(tk.Tk):
             self.launch_app(Path(f).name, [f])
 
     def toggle_system_proxy(self, on: bool):
-        """Включить/выключить системный HTTP/HTTPS proxy через настройки ОС."""
+        """Включить/выключить системный HTTP/HTTPS proxy через настройки ОС.
+        На macOS это серия `networksetup` команд (по 5 на каждый сервис) —
+        легко занимает 10-15 секунд. Делаем в фоне чтобы UI не замерзал."""
+        host_port = None
         if on:
             active = self._selected_or_first_proxy()
             if not active:
@@ -2764,33 +2767,40 @@ class App(tk.Tk):
                     "Сначала подключи ключ — системному прокси нужен порт активного подключения.")
                 return
             host_port = active["addr"]
-            ok, msg = system_proxy_set(host_port)
+        self.log_msg(f"системный прокси: {'применяю настройки…' if on else 'выключаю…'}")
+        threading.Thread(
+            target=self._toggle_system_proxy_thread,
+            args=(on, host_port),
+            daemon=True,
+        ).start()
+
+    def _toggle_system_proxy_thread(self, on: bool, host_port: str | None):
+        ok, msg = system_proxy_set(host_port if on else None)
+        def _show():
             if ok:
-                self._system_proxy_active = host_port
-                self.log_msg(f"системный прокси: вкл ({host_port})")
-                messagebox.showinfo(
-                    "Системный VPN включён",
-                    f"Весь HTTP/HTTPS-трафик системы теперь идёт через {host_port}.\n\n"
-                    "Что работает через VPN:\n"
-                    "  • Все браузеры (Chrome, Safari, Firefox, Edge…)\n"
-                    "  • Большинство приложений и мессенджеров\n"
-                    "  • git, npm, pip и прочие CLI\n\n"
-                    "Что НЕ через VPN:\n"
-                    "  • UDP-трафик (DNS, видеозвонки, игры)\n"
-                    "  • Apps игнорирующие системные настройки\n\n"
-                    "⚠ Не забудь выключить перед закрытием ZubriTunnel — иначе интернет ляжет!\n"
-                    "(если такое случилось — открой ZubriTunnel снова и нажми «системный VPN off»)"
-                )
+                self._system_proxy_active = host_port if on else None
+                if on:
+                    self.log_msg(f"системный прокси: вкл ({host_port})")
+                    messagebox.showinfo(
+                        "Системный VPN включён",
+                        f"Весь HTTP/HTTPS-трафик системы теперь идёт через {host_port}.\n\n"
+                        "Что работает через VPN:\n"
+                        "  • Все браузеры (Chrome, Safari, Firefox, Edge…)\n"
+                        "  • Большинство приложений и мессенджеров\n"
+                        "  • git, npm, pip и прочие CLI\n\n"
+                        "Что НЕ через VPN:\n"
+                        "  • UDP-трафик (DNS, видеозвонки, игры)\n"
+                        "  • Apps игнорирующие системные настройки\n\n"
+                        "⚠ Не забудь выключить перед закрытием ZubriTunnel — иначе интернет ляжет!"
+                    )
+                else:
+                    self.log_msg("системный прокси: выкл")
+                    messagebox.showinfo("Готово",
+                        "Системный VPN выключен. Все приложения теперь идут напрямую.")
             else:
-                messagebox.showerror("Ошибка", f"Не удалось включить:\n{msg}")
-        else:
-            ok, msg = system_proxy_set(None)
-            if ok:
-                self._system_proxy_active = None
-                self.log_msg("системный прокси: выкл")
-                messagebox.showinfo("Готово", "Системный VPN выключен. Все приложения теперь идут напрямую.")
-            else:
-                messagebox.showerror("Ошибка", f"Не удалось выключить:\n{msg}")
+                messagebox.showerror("Ошибка",
+                    f"Не удалось {'включить' if on else 'выключить'}:\n{msg}")
+        self.after(0, _show)
 
     def _selected_or_first_proxy(self):
         """Вернуть выбранный ключ если он подключён, иначе любой подключённый."""
