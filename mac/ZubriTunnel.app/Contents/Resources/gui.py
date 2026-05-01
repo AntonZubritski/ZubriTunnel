@@ -2058,7 +2058,16 @@ class App(tk.Tk):
             self.btn_disconnect.configure(state="disabled")
 
     def _start_proxy_subprocess(self, key_name: str, addr: str) -> subprocess.Popen | None:
-        cmd = go_command() + ["-key", key_name, "-no-menu", "-addr", addr]
+        # -keys-dir points vpn-proxy at the persistent storage (~/Library/...
+        # on Mac, %APPDATA% on Win). Without this it would look at ./keys/
+        # relative to its cwd = SCRIPT_DIR, which is inside the .app bundle
+        # and gets wiped on every upgrade.
+        cmd = go_command() + [
+            "-keys-dir", str(KEYS_DIR),
+            "-key", key_name,
+            "-no-menu",
+            "-addr", addr,
+        ]
         self.log_msg(f"$ {' '.join(cmd)}")
         try:
             popen_kwargs = dict(
@@ -2598,7 +2607,12 @@ class App(tk.Tk):
         self.log_msg(f"--- testing {k['name']} ---")
         # use a different port to not collide with running proxy
         addr = "127.0.0.1:18081"
-        cmd = go_command() + ["-key", k["name"], "-no-menu", "-addr", addr]
+        cmd = go_command() + [
+            "-keys-dir", str(KEYS_DIR),
+            "-key", k["name"],
+            "-no-menu",
+            "-addr", addr,
+        ]
         try:
             popen_kwargs = dict(cwd=str(SCRIPT_DIR), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=1, text=True, encoding="utf-8", errors="replace")
             if IS_WIN:
