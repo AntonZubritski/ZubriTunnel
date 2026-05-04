@@ -126,11 +126,12 @@ def find_openvpn_binary() -> str | None:
        2. System install (Homebrew / official installer / Tunnelblick)
        3. PATH
     Returns absolute path or None."""
-    # 1. Bundled
+    # 1. Bundled — check both next-to-exe AND inside _MEIPASS (PyInstaller --add-data)
     if os.name == "nt":
-        bundled = SCRIPT_DIR / "openvpn" / "openvpn.exe"
-        if bundled.is_file():
-            return str(bundled)
+        for bundled in (SCRIPT_DIR / "openvpn" / "openvpn.exe",
+                        BUNDLE_DIR / "openvpn" / "openvpn.exe"):
+            if bundled.is_file():
+                return str(bundled)
     elif sys.platform == "darwin":
         # In .app bundle: Frameworks/openvpn (sibling of MacOS/)
         for cand in (
@@ -222,11 +223,11 @@ def check_dependencies() -> list:
 
     # vpn-proxy binary
     cmd = go_command()
-    binary_path = cmd[0] if cmd[0] != "go" else None
+    binary_path = cmd[0] if cmd and cmd[0] != "go" and not cmd[0].endswith(("go", "go.exe")) else None
     deps.append({
         "name": "vpn-proxy",
         "ok": binary_path is not None,
-        "detail": binary_path or "не найден — будет fallback на 'go run'",
+        "detail": binary_path or "не найден — нажми «Собрать» или скачай свежий релиз",
         "fix_label": "Собрать" if not binary_path else None,
         "fix_action": "build_vpn_proxy" if not binary_path else None,
     })
@@ -282,22 +283,23 @@ def check_dependencies() -> list:
 
 def go_command() -> list:
     """Return the command list to launch vpn-proxy. Order:
-       1. binary next to gui.py (./vpn-proxy or ./vpn-proxy.exe)
-       2. mac .app bundle: ../MacOS/vpn-proxy (CI-built universal binary)
-       3. `go run .` fallback using absolute go path if Go SDK is installed
+       1. binary next to ZubriTunnel.exe / gui.py (./vpn-proxy[.exe])
+       2. PyInstaller-bundled copy inside _MEIPASS (added via --add-binary in CI)
+       3. mac .app bundle: ../MacOS/vpn-proxy (CI-built universal binary)
+       4. `go run .` fallback (dev mode only — never reachable from frozen .exe)
     """
-    if IS_WIN:
-        exe = SCRIPT_DIR / "vpn-proxy.exe"
-        if exe.exists():
-            return [str(exe)]
-    else:
-        exe = SCRIPT_DIR / "vpn-proxy"
-        if exe.exists():
-            return [str(exe)]
-        macos_exe = SCRIPT_DIR.parent / "MacOS" / "vpn-proxy"
-        if macos_exe.exists():
-            return [str(macos_exe)]
-    # Fall back to "go run ." using absolute path so PATH-less subprocesses still find it
+    name = "vpn-proxy.exe" if IS_WIN else "vpn-proxy"
+    candidates = [SCRIPT_DIR / name, BUNDLE_DIR / name]
+    if IS_MAC:
+        candidates.append(SCRIPT_DIR.parent / "MacOS" / "vpn-proxy")
+    for c in candidates:
+        if c.exists():
+            return [str(c)]
+    # Frozen builds must never hit `go run` — Go isn't expected on user machines
+    # and even if installed there's no go.mod inside _MEIPASS to compile against.
+    if getattr(sys, "frozen", False):
+        return []
+    # Dev mode: source tree is right here, fall back to `go run .`
     go = find_go_binary() or "go"
     return [go, "run", "."]
 
@@ -2073,12 +2075,29 @@ class App(tk.Tk):
             self.btn_connect.configure(state="normal")
             self.btn_disconnect.configure(state="disabled")
 
+    def _show_no_engine_error(self):
+        # vpn-proxy.exe missing AND we're in a frozen build — most likely the
+        # user launched ZubriTunnel.exe from inside a .zip without extracting.
+        where = "ZubriTunnel.app/Contents/MacOS/" if IS_MAC else "папке с ZubriTunnel.exe"
+        msg = (
+            "Не найден vpn-proxy (движок VPN).\n\n"
+            "Самые частые причины:\n"
+            f"  • Архив не распакован — запусти .exe из распакованной папки, не из zip\n"
+            f"  • Антивирус удалил vpn-proxy из {where}\n"
+            "  • Сломанная установка — переустанови с github.com/AntonZubritski/ZubriTunnel/releases"
+        )
+        messagebox.showerror("vpn-proxy не найден", msg)
+
     def _start_proxy_subprocess(self, key_name: str, addr: str) -> subprocess.Popen | None:
         # -keys-dir points vpn-proxy at the persistent storage (~/Library/...
         # on Mac, %APPDATA% on Win). Without this it would look at ./keys/
         # relative to its cwd = SCRIPT_DIR, which is inside the .app bundle
         # and gets wiped on every upgrade.
-        cmd = go_command() + [
+        base = go_command()
+        if not base:
+            self._show_no_engine_error()
+            return None
+        cmd = base + [
             "-keys-dir", str(KEYS_DIR),
             "-key", key_name,
             "-no-menu",
@@ -2365,7 +2384,11 @@ class App(tk.Tk):
         has reported its utun device — the bridge needs the iface to exist.
         Stores the proc handle in self.proxies[key_name]['bridge_proc'] so
         _stop_ovpn() can kill it cleanly."""
-        cmd = go_command() + [
+        base = go_command()
+        if not base:
+            self._show_no_engine_error()
+            return
+        cmd = base + [
             "-bridge-iface", iface,
             "-addr", addr,
         ]
@@ -2866,7 +2889,11 @@ class App(tk.Tk):
         self.log_msg(f"--- testing {k['name']} ---")
         # use a different port to not collide with running proxy
         addr = "127.0.0.1:18081"
-        cmd = go_command() + [
+        base = go_command()
+        if not base:
+            self.after(0, self._show_no_engine_error)
+            return
+        cmd = base + [
             "-keys-dir", str(KEYS_DIR),
             "-key", k["name"],
             "-no-menu",

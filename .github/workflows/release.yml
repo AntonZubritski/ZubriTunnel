@@ -77,12 +77,19 @@ jobs:
         working-directory: windows
         run: |
           python -m pip install --upgrade pip pyinstaller
+          # Embed vpn-proxy.exe + openvpn\ INSIDE ZubriTunnel.exe so the .exe
+          # works even when launched directly from inside a .zip (Windows
+          # Explorer extracts only the launched file to a temp dir — siblings
+          # stay locked in the archive). We still ship them next to the .exe
+          # in the zip too, so power users can swap the engine.
           pyinstaller --onefile --windowed --noconfirm --clean `
                       --icon icon.ico `
                       --name ZubriTunnel `
                       --add-data "icon.ico;." `
                       --add-data "icon.png;." `
                       --add-data "VERSION;." `
+                      --add-binary "vpn-proxy.exe;." `
+                      --add-data "openvpn;openvpn" `
                       gui.py
           Move-Item -Force dist\ZubriTunnel.exe .\ZubriTunnel.exe
           # Cleanup PyInstaller intermediates so they don't go in the release
