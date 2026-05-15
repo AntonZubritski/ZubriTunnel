@@ -430,9 +430,20 @@ def list_keys() -> list:
 
 def detect_apps() -> list:
     """Return list of (name, command) for known apps installed on this system."""
+    import glob as _glob
     apps = []
     if IS_WIN:
         local = os.environ.get("LOCALAPPDATA", "")
+        roaming = os.environ.get("APPDATA", "")
+        # Discord installs into %LOCALAPPDATA%\Discord\app-X.Y.Z\Discord.exe and
+        # bumps the version directory each auto-update. Glob lets us find the
+        # newest one regardless of version.
+        discord_candidates = []
+        if local:
+            discord_candidates = sorted(
+                _glob.glob(fr"{local}\Discord\app-*\Discord.exe"),
+                reverse=True,  # newest version first
+            )
         candidates = [
             ("VSCode", [r"C:\Program Files\Microsoft VS Code\Code.exe", fr"{local}\Programs\Microsoft VS Code\Code.exe"]),
             ("Git Bash", [r"C:\Program Files\Git\git-bash.exe", r"C:\Program Files (x86)\Git\git-bash.exe"]),
@@ -442,10 +453,22 @@ def detect_apps() -> list:
             ("Chrome", [r"C:\Program Files\Google\Chrome\Application\chrome.exe", r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"]),
             ("Firefox", [r"C:\Program Files\Mozilla Firefox\firefox.exe"]),
             ("Edge", [r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"]),
+            ("Brave", [fr"{local}\BraveSoftware\Brave-Browser\Application\brave.exe",
+                       r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe"]),
+            ("Opera", [fr"{local}\Programs\Opera\opera.exe",
+                       fr"{local}\Programs\Opera GX\opera.exe"]),
+            ("Vivaldi", [fr"{local}\Vivaldi\Application\vivaldi.exe",
+                         r"C:\Program Files\Vivaldi\Application\vivaldi.exe"]),
+            ("Yandex", [fr"{local}\Yandex\YandexBrowser\Application\browser.exe"]),
+            ("Discord", discord_candidates),
+            ("Telegram", [fr"{roaming}\Telegram Desktop\Telegram.exe",
+                          fr"{local}\Programs\Telegram Desktop\Telegram.exe"]),
+            ("Slack", [fr"{local}\slack\slack.exe"]),
+            ("Spotify", [fr"{roaming}\Spotify\Spotify.exe"]),
         ]
         for name, paths in candidates:
             for p in paths:
-                if os.path.exists(p):
+                if p and os.path.exists(p):
                     apps.append((name, [p]))
                     break
     elif IS_MAC:
@@ -1416,8 +1439,32 @@ class App(tk.Tk):
         self._busy_phase = 0
         self._busy_spinner = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 
+        # ---- Tab switcher (минималистичный сегментированный) ----
+        # Лежит в outer вместе со status card; переключает видимость
+        # tab_vpn / tab_apps ниже. Активный таб сохраняется в settings.json.
+        self.active_tab = self.settings.get("active_tab", "vpn")
+        if self.active_tab not in ("vpn", "apps"):
+            self.active_tab = "vpn"
+        tabs_row = tk.Frame(outer, bg=COLORS["bg"])
+        tabs_row.pack(fill="x", pady=(0, 12))
+        self._tab_buttons = {}
+        for code, label in [("vpn", "VPN"), ("apps", "Прокси для программ")]:
+            holder = tk.Frame(tabs_row, bg=COLORS["bg"])
+            holder.pack(side="left", padx=(0, 6))
+            btn = tk.Label(holder, text=label, bg=COLORS["bg"], fg=COLORS["text"],
+                           font=UI_FONT_BOLD, cursor="hand2", padx=14, pady=8)
+            btn.pack(side="top", fill="x")
+            underline = tk.Frame(holder, bg=COLORS["bg"], height=2)
+            underline.pack(side="top", fill="x")
+            btn.bind("<Button-1>", lambda _e, c=code: self._switch_tab(c))
+            self._tab_buttons[code] = (btn, underline)
+
+        # ---- Tab 1: VPN (исходный контент) ----
+        tab_vpn = tk.Frame(outer, bg=COLORS["bg"])
+        self._tab_vpn = tab_vpn
+
         # Keys card
-        kf = self._rounded_card(outer, title="Ключи")
+        kf = self._rounded_card(tab_vpn, title="Ключи")
         kf.pack(fill="both", expand=False, pady=(0, 12))
 
         cols = ("status", "name", "tag", "server", "port")
@@ -1455,7 +1502,7 @@ class App(tk.Tk):
         RoundButton(kbar, text="открыть keys/", variant="tool", command=self.open_keys_dir).pack(side="right")
 
         # Proxy card
-        cf = self._rounded_card(outer, title="Прокси")
+        cf = self._rounded_card(tab_vpn, title="Прокси")
         cf.pack(fill="x", pady=(0, 12))
         cbar = tk.Frame(cf.content, bg=COLORS["panel"])
         cbar.pack(fill="x")
@@ -1469,14 +1516,14 @@ class App(tk.Tk):
         RoundButton(cbar, text="Запущенные приложения", variant="default", command=self.show_apps_dialog).pack(side="right")
 
         # Launch card
-        lf = self._rounded_card(outer, title="Запустить через прокси выделенного ключа")
+        lf = self._rounded_card(tab_vpn, title="Запустить через прокси выделенного ключа")
         lf.pack(fill="x", pady=(0, 12))
         self.launch_frame = tk.Frame(lf.content, bg=COLORS["panel"])
         self.launch_frame.pack(fill="x")
         self._build_launch_buttons()
 
         # Log card — compact footer; full log opens in a separate window
-        log_card = self._rounded_card(outer)
+        log_card = self._rounded_card(tab_vpn)
         log_card.pack(fill="x", pady=(0, 0))
         log_row = tk.Frame(log_card.content, bg=COLORS["panel"])
         log_row.pack(fill="x")
@@ -1487,6 +1534,14 @@ class App(tk.Tk):
         self._log_count_label.pack(side="left", padx=10)
         RoundButton(log_row, text="Открыть в окне", variant="tool",
                     command=self.open_log_window).pack(side="right")
+
+        # ---- Tab 2: «Прокси для программ» (новый шорткат) ----
+        tab_apps = tk.Frame(outer, bg=COLORS["bg"])
+        self._tab_apps = tab_apps
+        self._build_apps_tab(tab_apps)
+
+        # Активируем сохранённый таб
+        self._switch_tab(self.active_tab, save=False)
 
     def _rounded_card(self, parent, title: str | None = None) -> RoundedCard:
         card = RoundedCard(parent, radius=18, fill=COLORS["panel"])
@@ -1525,6 +1580,176 @@ class App(tk.Tk):
                              command=lambda: self.toggle_system_proxy(True)))
         flow.add(RoundButton(flow, text="системный VPN off", variant="tool",
                              command=lambda: self.toggle_system_proxy(False)))
+
+    # ---- tab switcher ----
+
+    def _switch_tab(self, code: str, save: bool = True):
+        """Показать tab_vpn / tab_apps, спрятать другой.
+        Сохраняем выбор в settings.json чтобы при перезапуске возвращался."""
+        if code not in ("vpn", "apps"):
+            code = "vpn"
+        self.active_tab = code
+        # Pack ordering — show selected first, hide other
+        for c, frame in (("vpn", getattr(self, "_tab_vpn", None)),
+                         ("apps", getattr(self, "_tab_apps", None))):
+            if frame is None:
+                continue
+            if c == code:
+                if not frame.winfo_ismapped():
+                    frame.pack(fill="both", expand=True)
+            else:
+                if frame.winfo_ismapped():
+                    frame.pack_forget()
+        # Repaint tab underlines/colours
+        for c, (btn, underline) in getattr(self, "_tab_buttons", {}).items():
+            is_active = (c == code)
+            try:
+                btn.configure(fg=COLORS["accent"] if is_active else COLORS["muted"])
+                underline.configure(bg=COLORS["accent"] if is_active else COLORS["bg"])
+            except tk.TclError:
+                pass
+        if code == "apps":
+            self._refresh_apps_tab_status()
+        if save:
+            try:
+                self.settings["active_tab"] = code
+                save_settings(self.settings)
+            except Exception:
+                pass
+
+    # ---- «Прокси для программ» tab ----
+
+    def _build_apps_tab(self, parent):
+        """Минималистичный шорткат-таб: одна карта с кнопками-приложениями,
+        статус активного прокси и подсказки для Telegram/Discord. Использует
+        существующий launch_app(), без дублирования логики."""
+        card = self._rounded_card(parent, title="Выберите программу для запуска через VPN")
+        card.pack(fill="both", expand=True, pady=(0, 12))
+
+        # Список приложений (FlowFrame — wrap)
+        self._apps_flow_host = tk.Frame(card.content, bg=COLORS["panel"])
+        self._apps_flow_host.pack(fill="x", pady=(0, 10))
+        self._apps_buttons: list = []
+        flow = FlowFrame(self._apps_flow_host, bg=COLORS["panel"], hgap=8, vgap=8)
+        flow.pack(fill="x", expand=True)
+        for name, cmd in detect_apps():
+            btn = RoundButton(
+                flow, text=name, variant="tool",
+                command=lambda c=cmd, n=name: self.launch_app(n, c),
+                padx=18, pady=10,
+            )
+            flow.add(btn)
+            self._apps_buttons.append(btn)
+        custom_btn = RoundButton(flow, text="Custom…", variant="tool",
+                                 command=self.launch_custom,
+                                 padx=18, pady=10)
+        flow.add(custom_btn)
+        self._apps_buttons.append(custom_btn)
+
+        # Status block — какой прокси активен / hint когда не подключён
+        self._apps_status_box = tk.Frame(card.content, bg=COLORS["panel"])
+        self._apps_status_box.pack(fill="x", pady=(8, 0))
+        self._apps_status_label = tk.Label(
+            self._apps_status_box, text="", bg=COLORS["panel"], fg=COLORS["muted"],
+            font=UI_FONT, justify="left", anchor="w", wraplength=720,
+        )
+        self._apps_status_label.pack(fill="x", anchor="w")
+
+        # Telegram hint — SOCKS5 + copy button (показывается только когда есть SOCKS5)
+        self._apps_telegram_row = tk.Frame(card.content, bg=COLORS["panel"])
+        self._apps_telegram_label = tk.Label(
+            self._apps_telegram_row, text="", bg=COLORS["panel"], fg=COLORS["text"],
+            font=UI_FONT, justify="left", anchor="w", wraplength=600,
+        )
+        self._apps_telegram_label.pack(side="left", fill="x", expand=True)
+        self._apps_telegram_copy = RoundButton(
+            self._apps_telegram_row, text="Копировать адрес", variant="tool",
+            command=self._copy_socks5_addr,
+        )
+        self._apps_telegram_copy.pack(side="right", padx=(8, 0))
+
+        # Discord hint — info-only
+        self._apps_discord_label = tk.Label(
+            card.content,
+            text="Discord не поддерживает настройку прокси. Используй кнопку выше — "
+                 "мы запустим Discord с переменными окружения HTTP_PROXY / HTTPS_PROXY.",
+            bg=COLORS["panel"], fg=COLORS["muted"], font=UI_FONT,
+            justify="left", anchor="w", wraplength=720,
+        )
+        self._apps_discord_label.pack(fill="x", pady=(10, 0))
+
+        self._refresh_apps_tab_status()
+
+    def _copy_socks5_addr(self):
+        """Копирует адрес SOCKS5 активного прокси в буфер обмена."""
+        active = self._selected_or_first_proxy()
+        if not active:
+            return
+        s = active.get("socks5_addr")
+        if not s:
+            return
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(s)
+            self.log_msg(f"SOCKS5 адрес скопирован: {s}")
+        except Exception:
+            pass
+
+    def _refresh_apps_tab_status(self):
+        """Обновить статус-строку, видимость подсказок и enabled-состояние кнопок.
+        Вызывается из connect/disconnect/_poll_procs."""
+        if not hasattr(self, "_apps_status_label"):
+            return
+        active = self._selected_or_first_proxy()
+        if active and active.get("proc") and active["proc"].poll() is None:
+            http_addr = active.get("addr", "")
+            socks5_addr = active.get("socks5_addr")
+            tag = active.get("key_tag", "")
+            lines = [f"Активен: {tag}  ·  HTTP {http_addr}"]
+            if socks5_addr:
+                lines.append(f"SOCKS5: {socks5_addr}")
+            else:
+                lines.append("SOCKS5: недоступен (обнови vpn-proxy)")
+            self._apps_status_label.configure(
+                text="\n".join(lines),
+                fg=COLORS["text"],
+            )
+            # Кнопки enabled
+            for btn in getattr(self, "_apps_buttons", []):
+                try: btn.set_state("normal")
+                except Exception: pass
+            # Telegram-подсказка
+            if socks5_addr:
+                host, _, port = socks5_addr.partition(":")
+                self._apps_telegram_label.configure(
+                    text=(
+                        "Для Telegram: Settings → Advanced → Connection type → "
+                        f"SOCKS5 → host {host}, port {port}"
+                    ),
+                    fg=COLORS["text"],
+                )
+                if not self._apps_telegram_row.winfo_ismapped():
+                    self._apps_telegram_row.pack(
+                        fill="x", pady=(10, 0), after=self._apps_status_box,
+                    )
+            else:
+                if self._apps_telegram_row.winfo_ismapped():
+                    self._apps_telegram_row.pack_forget()
+        else:
+            self._apps_status_label.configure(
+                text="Подключите VPN, чтобы запускать программы через прокси.",
+                fg=COLORS["muted"],
+            )
+            for btn in getattr(self, "_apps_buttons", []):
+                try: btn.set_state("disabled")
+                except Exception: pass
+            if self._apps_telegram_row.winfo_ismapped():
+                self._apps_telegram_row.pack_forget()
+        # Repaint colours (in case theme changed)
+        try:
+            self._apps_discord_label.configure(bg=COLORS["panel"], fg=COLORS["muted"])
+        except Exception:
+            pass
 
     # ---- key management ----
 
@@ -2007,10 +2232,12 @@ class App(tk.Tk):
     def _used_local_ports(self) -> set:
         used = set()
         for v in self.proxies.values():
-            try:
-                used.add(int(v["addr"].split(":")[1]))
-            except (KeyError, ValueError, IndexError):
-                pass
+            for key in ("addr", "socks5_addr"):
+                a = v.get(key) or ""
+                try:
+                    used.add(int(a.split(":")[1]))
+                except (ValueError, IndexError):
+                    pass
         return used
 
     def _on_select_key(self):
@@ -2060,6 +2287,7 @@ class App(tk.Tk):
         if not sel:
             self.status_dot.configure(fg="#888")
             self.status_text.configure(text="выбери ключ")
+            self._refresh_apps_tab_status()
             return
         p = self.proxies.get(sel["name"])
         if p and p["proc"].poll() is None:
@@ -2074,6 +2302,8 @@ class App(tk.Tk):
             self.status_text.configure(text=f"  {sel['name']} не подключён{extra}")
             self.btn_connect.configure(state="normal")
             self.btn_disconnect.configure(state="disabled")
+        # Tab «Прокси для программ» — статус-блок и enabled-кнопки
+        self._refresh_apps_tab_status()
 
     def _show_no_engine_error(self):
         # vpn-proxy.exe missing AND we're in a frozen build — most likely the
@@ -2088,7 +2318,8 @@ class App(tk.Tk):
         )
         messagebox.showerror("vpn-proxy не найден", msg)
 
-    def _start_proxy_subprocess(self, key_name: str, addr: str) -> subprocess.Popen | None:
+    def _start_proxy_subprocess(self, key_name: str, addr: str,
+                                 socks5_addr: str | None = None) -> subprocess.Popen | None:
         # -keys-dir points vpn-proxy at the persistent storage (~/Library/...
         # on Mac, %APPDATA% on Win). Without this it would look at ./keys/
         # relative to its cwd = SCRIPT_DIR, which is inside the .app bundle
@@ -2103,6 +2334,12 @@ class App(tk.Tk):
             "-no-menu",
             "-addr", addr,
         ]
+        # Optional SOCKS5 listener — for apps that only support SOCKS5 (Telegram).
+        # vpn-proxy ignores this flag if the binary doesn't yet support it
+        # (older builds will fail with "flag provided but not defined"; we
+        # log a warning but the HTTP listener keeps working since it goes first).
+        if socks5_addr:
+            cmd += ["-socks5-addr", socks5_addr]
         self.log_msg(f"$ {' '.join(cmd)}")
         try:
             popen_kwargs = dict(
@@ -2163,13 +2400,27 @@ class App(tk.Tk):
             return
 
         # ---- standard shadowsocks ----
-        free = find_free_port("127.0.0.1", 8080, avoid=self._used_local_ports())
+        used = self._used_local_ports()
+        free = find_free_port("127.0.0.1", 8080, avoid=used)
         addr = f"127.0.0.1:{free}"
-        proc = self._start_proxy_subprocess(k["name"], addr)
+        # SOCKS5 listener on a separate port — newer vpn-proxy supports
+        # -socks5-addr so apps like Telegram (no HTTP-proxy support) can
+        # still go through the tunnel.
+        socks5_port = find_free_port("127.0.0.1", 1080, avoid=used | {free})
+        socks5_addr = f"127.0.0.1:{socks5_port}"
+        proc = self._start_proxy_subprocess(k["name"], addr, socks5_addr=socks5_addr)
         if not proc:
             return
-        self.proxies[k["name"]] = {"proc": proc, "addr": addr, "key_tag": k["tag"] or k["name"]}
+        self.proxies[k["name"]] = {
+            "proc": proc,
+            "addr": addr,
+            "socks5_addr": socks5_addr,
+            "key_tag": k["tag"] or k["name"],
+        }
+        self.log_msg(f"{k['name']}: HTTP proxy: {addr}, SOCKS5: {socks5_addr}")
         self._update_status_display()
+        if hasattr(self, "_refresh_apps_tab_status"):
+            self._refresh_apps_tab_status()
         threading.Thread(target=self._wait_listening, args=(proc, k, addr), daemon=True).start()
 
     def _connect_ovpn(self, k: dict, raw: dict):

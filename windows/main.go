@@ -2,12 +2,14 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -19,6 +21,7 @@ import (
 	"strings"
 	"syscall"
 
+	socks5 "github.com/things-go/go-socks5"
 	"golang.getoutline.org/sdk/x/mobileproxy"
 )
 
@@ -37,6 +40,7 @@ func main() {
 	keyName := flag.String("key", "", "name of key in keys/ folder (filename without .json)")
 	keysDir := flag.String("keys-dir", "keys", "folder with multiple JSON keys")
 	addr := flag.String("addr", "127.0.0.1:8080", "local HTTP proxy address")
+	socks5Addr := flag.String("socks5-addr", "", "SOCKS5 listen address (e.g. 127.0.0.1:1080); empty = disabled")
 	launch := flag.String("launch", "", "what to start: code | bash | terminal | <path>. Empty = interactive menu")
 	noMenu := flag.Bool("no-menu", false, "skip menu, just run proxy")
 	flag.Parse()
@@ -79,6 +83,27 @@ func main() {
 	proxyURL := "http://" + proxy.Address()
 	log.Printf("HTTP proxy listening on %s", proxyURL)
 
+	// SOCKS5 proxy — optional, same dialer as HTTP proxy.
+	var socks5Listener net.Listener
+	if *socks5Addr != "" {
+		socks5Listener, err = net.Listen("tcp", *socks5Addr)
+		if err != nil {
+			log.Fatalf("socks5 listen: %v", err)
+		}
+		srv := socks5.NewServer(
+			socks5.WithDial(func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return dialer.DialStream(ctx, addr)
+			}),
+		)
+		go func() {
+			log.Printf("SOCKS5 proxy listening on %s", *socks5Addr)
+			if err := srv.Serve(socks5Listener); err != nil {
+				// Listener closed on shutdown — not an error worth logging loudly.
+				log.Printf("SOCKS5 server stopped: %v", err)
+			}
+		}()
+	}
+
 	choice := *launch
 	if choice == "" && !*noMenu {
 		choice = askMenu()
@@ -97,6 +122,9 @@ func main() {
 	<-sig
 	log.Print("shutting down")
 	proxy.Stop(2)
+	if socks5Listener != nil {
+		socks5Listener.Close()
+	}
 }
 
 // selectKey resolves where to take the VPN key from:
