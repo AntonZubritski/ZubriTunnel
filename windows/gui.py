@@ -1635,13 +1635,13 @@ class App(tk.Tk):
         for name, cmd in detect_apps():
             btn = RoundButton(
                 flow, text=name, variant="tool",
-                command=lambda c=cmd, n=name: self.launch_app(n, c),
+                command=lambda c=cmd, n=name: self._apps_tab_launch(n, c),
                 padx=18, pady=10,
             )
             flow.add(btn)
             self._apps_buttons.append(btn)
         custom_btn = RoundButton(flow, text="Custom…", variant="tool",
-                                 command=self.launch_custom,
+                                 command=lambda: self._apps_tab_launch_custom(),
                                  padx=18, pady=10)
         flow.add(custom_btn)
         self._apps_buttons.append(custom_btn)
@@ -1679,6 +1679,47 @@ class App(tk.Tk):
         self._apps_discord_label.pack(fill="x", pady=(10, 0))
 
         self._refresh_apps_tab_status()
+
+    def _has_active_proxy(self) -> bool:
+        active = self._selected_or_first_proxy()
+        return bool(active and active.get("proc") and active["proc"].poll() is None)
+
+    def _apps_tab_launch(self, name: str, cmd):
+        """Клик по кнопке программы в табе «Прокси для программ».
+        Если есть активный VPN — запускаем программу с прокси.
+        Иначе — переключаем на таб VPN и показываем подсказку."""
+        if self._has_active_proxy():
+            self.launch_app(name, cmd)
+            return
+        self._prompt_connect_first(name)
+
+    def _apps_tab_launch_custom(self):
+        if self._has_active_proxy():
+            self.launch_custom()
+            return
+        self._prompt_connect_first("программу")
+
+    def _prompt_connect_first(self, what: str):
+        """Подсказать юзеру: сначала подключи VPN, и переключиться на таб VPN.
+        Если нет ключей — попросить добавить ключ."""
+        keys = list_keys()
+        self._switch_tab("vpn")
+        if not keys:
+            messagebox.showinfo(
+                "Нужен VPN-ключ",
+                "Сначала добавь VPN-ключ — кнопка «Добавить ключ» во вкладке VPN.",
+            )
+            return
+        # Auto-select первый ключ если ничего не выбрано
+        if not self.tree.selection() and self.tree.get_children():
+            first = self.tree.get_children()[0]
+            self.tree.selection_set(first)
+            self.tree.focus(first)
+        messagebox.showinfo(
+            "Сначала подключите VPN",
+            f"Выбери ключ в списке и нажми «Подключить», затем вернись на вкладку "
+            f"«Прокси для программ» и запусти {what}.",
+        )
 
     def _copy_socks5_addr(self):
         """Копирует адрес SOCKS5 активного прокси в буфер обмена."""
@@ -1737,11 +1778,11 @@ class App(tk.Tk):
                     self._apps_telegram_row.pack_forget()
         else:
             self._apps_status_label.configure(
-                text="Подключите VPN, чтобы запускать программы через прокси.",
+                text="Нет активного VPN — нажми любую программу выше, мы подскажем что делать.",
                 fg=COLORS["muted"],
             )
             for btn in getattr(self, "_apps_buttons", []):
-                try: btn.set_state("disabled")
+                try: btn.set_state("normal")
                 except Exception: pass
             if self._apps_telegram_row.winfo_ismapped():
                 self._apps_telegram_row.pack_forget()
