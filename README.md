@@ -115,6 +115,25 @@ curl -fsSL https://raw.githubusercontent.com/AntonZubritski/ZubriTunnel/main/ins
 
 ---
 
+## Обход DPI без VPN (Windows)
+
+Для пользователей в России, которым нужно разблокировать Discord / YouTube / Telegram без VPN-сервера — встроен режим **DPI-обход** на базе [zapret-discord-youtube](https://github.com/Flowseal/zapret-discord-youtube) (MIT).
+
+Как использовать:
+
+1. Открой вкладку **«Прокси для программ»**
+2. В нижней карточке **«Обход блокировок без VPN»** нажми **«Включить DPI-обход»**
+3. Разреши UAC-запрос (нужны права администратора)
+4. При первом запуске может сработать антивирус — добавь папку ZubriTunnel в исключения (это ложное срабатывание на `WinDivert64.sys`)
+
+Твой IP при этом **не меняется** — обход работает на уровне сетевых пакетов, VPN-сервер не нужен.
+
+> На Mac эта функция недоступна — используй VPN-режим.
+
+> Требует admin при каждом запуске. Использует WinDivert от [Reqrypt](https://reqrypt.org/windivert.html).
+
+---
+
 ## Структура релиза
 
 ```

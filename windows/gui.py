@@ -304,6 +304,37 @@ def go_command() -> list:
     return [go, "run", "."]
 
 
+def find_zapret_dir() -> "Path | None":
+    """Locate the zapret folder: bundled inside _MEIPASS, next to exe, or in source."""
+    for base in (BUNDLE_DIR, SCRIPT_DIR):
+        cand = base / "zapret"
+        if (cand / "bin" / "winws.exe").is_file():
+            return cand
+    return None
+
+
+ZAPRET_STRATEGIES = {
+    "general": {
+        "label": "Базовая (Discord + YouTube)",
+        "args": [
+            "--wf-tcp=80,443",
+            "--wf-udp=443,50000-65535",
+            "--filter-udp=443",
+            "--hostlist={hostlist}",
+            "--dpi-desync=fake",
+            "--dpi-desync-repeats=6",
+            "--dpi-desync-fake-quic={bin}/quic_initial_www_google_com.bin",
+            "--new",
+            "--filter-tcp=80,443",
+            "--hostlist={hostlist}",
+            "--dpi-desync=fake,multisplit",
+            "--dpi-desync-repeats=6",
+            "--dpi-desync-fake-tls={bin}/tls_clienthello_www_google_com.bin",
+        ],
+    },
+}
+
+
 def parse_ovpn_config(text: str) -> dict:
     """Quick parser for .ovpn — extracts the key fields ZubriTunnel cares about
     (server, port, protocol). The full config text is preserved so that on
@@ -1248,9 +1279,15 @@ class App(tk.Tk):
         # disconnect-time cleanup only destroys interfaces we actually created.
         # Maps proxy-name -> "utunN". NEVER touch utuns we didn't put here.
         self._our_utuns: dict[str, str] = {}
+        self.zapret_proc = None
+        self.zapret_strategy = "general"
 
     def _on_close(self):
         """Window-close handler: stop all proxies (incl. ovpn cleanup), then exit."""
+        try:
+            self.stop_zapret()
+        except Exception:
+            pass
         try:
             for name, p in list(self.proxies.items()):
                 try:
@@ -1678,6 +1715,48 @@ class App(tk.Tk):
         )
         self._apps_discord_label.pack(fill="x", pady=(10, 0))
 
+        # ---- DPI-обход без VPN (zapret / winws.exe) ----
+        zapret_card = self._rounded_card(parent, title="Обход блокировок без VPN (Windows)")
+        zapret_card.pack(fill="x", pady=(12, 0))
+        zap_body = zapret_card.content
+
+        if IS_MAC:
+            tk.Label(zap_body,
+                text="Работает только на Windows. На Mac используй VPN-режим выше.",
+                bg=COLORS["panel"], fg=COLORS["muted"], font=UI_FONT,
+                justify="left", anchor="w", wraplength=720,
+            ).pack(fill="x", anchor="w")
+        elif find_zapret_dir() is None:
+            tk.Label(zap_body,
+                text="zapret не найден в сборке — перекачай свежий релиз с GitHub.",
+                bg=COLORS["panel"], fg=COLORS["warn"], font=UI_FONT,
+                justify="left", anchor="w", wraplength=720,
+            ).pack(fill="x", anchor="w")
+        else:
+            tk.Label(zap_body,
+                text="Разблокировка Discord / YouTube / Telegram на уровне DPI. "
+                     "Не нужен VPN-сервер, твой IP остаётся прежним. "
+                     "Требует прав администратора (будет UAC-промпт).",
+                bg=COLORS["panel"], fg=COLORS["text"], font=UI_FONT,
+                justify="left", anchor="w", wraplength=720,
+            ).pack(fill="x", anchor="w", pady=(0, 8))
+
+            self._zapret_status = tk.Label(zap_body, text="Выключен",
+                                           bg=COLORS["panel"], fg=COLORS["muted"],
+                                           font=UI_FONT_BOLD)
+            self._zapret_status.pack(fill="x", anchor="w", pady=(0, 8))
+
+            btns = tk.Frame(zap_body, bg=COLORS["panel"])
+            btns.pack(fill="x", anchor="w")
+            self._zapret_btn_start = RoundButton(btns, text="Включить DPI-обход",
+                                                  variant="accent",
+                                                  command=lambda: self.start_zapret("general"))
+            self._zapret_btn_start.pack(side="left")
+            self._zapret_btn_stop = RoundButton(btns, text="Остановить",
+                                                 variant="tool",
+                                                 command=self.stop_zapret)
+            self._zapret_btn_stop.pack(side="left", padx=(8, 0))
+
         self._refresh_apps_tab_status()
 
     def _has_active_proxy(self) -> bool:
@@ -1791,6 +1870,103 @@ class App(tk.Tk):
             self._apps_discord_label.configure(bg=COLORS["panel"], fg=COLORS["muted"])
         except Exception:
             pass
+        self._refresh_zapret_card()
+
+    # ---- zapret / DPI bypass ----
+
+    def start_zapret(self, strategy: str = "general") -> bool:
+        """Запустить winws.exe в фоне. Требует admin (UAC-промпт)."""
+        if IS_MAC:
+            messagebox.showinfo("Недоступно на Mac",
+                "DPI-обход (zapret) работает только на Windows. На Mac используй VPN.")
+            return False
+        zd = find_zapret_dir()
+        if zd is None:
+            messagebox.showerror("Zapret не найден",
+                "Файлы zapret отсутствуют в этой сборке. Перекачай свежий релиз.")
+            return False
+        if self.zapret_proc and self.zapret_proc.poll() is None:
+            self.log_msg("zapret уже запущен")
+            return True
+        bin_dir = zd / "bin"
+        lists_dir = zd / "lists"
+        winws = bin_dir / "winws.exe"
+        hostlist = lists_dir / "list-general.txt"
+        template = ZAPRET_STRATEGIES.get(strategy, ZAPRET_STRATEGIES["general"])
+        args = [str(winws)] + [
+            a.format(hostlist=str(hostlist), bin=str(bin_dir).replace("\\", "/"))
+            for a in template["args"]
+        ]
+        # AV-warning при первом запуске
+        if not self.settings.get("zapret_av_warned"):
+            ok = messagebox.askokcancel("Внимание: антивирус",
+                "Для обхода DPI используется драйвер WinDivert64.sys (часть zapret). "
+                "Некоторые антивирусы (Kaspersky, Defender) могут пометить его как PUA "
+                "— это ложное срабатывание, файл подписан и безопасен.\n\n"
+                "Добавь папку ZubriTunnel в исключения если будет проблема.\n\nПродолжить?")
+            if not ok:
+                return False
+            self.settings["zapret_av_warned"] = True
+            self._save_settings()
+        try:
+            kwargs = _win_subprocess_kwargs() if IS_WIN else {}
+            # winws.exe сам ищет WinDivert.dll/.sys в cwd
+            proc = subprocess.Popen(args, cwd=str(bin_dir), **kwargs)
+        except OSError as e:
+            # Типично — "Запрос не подтверждён" ⇒ UAC denied (errno 1223)
+            self.log_msg(f"zapret не стартовал: {e}")
+            messagebox.showerror("Запуск отменён",
+                "Для DPI-обхода нужны права администратора.")
+            return False
+        self.zapret_proc = proc
+        self.zapret_strategy = strategy
+        self.log_msg(f"zapret запущен (PID {proc.pid}, стратегия: {strategy})")
+        self._refresh_zapret_card()
+        self.after(2000, self._poll_zapret)
+        return True
+
+    def stop_zapret(self):
+        p = getattr(self, "zapret_proc", None)
+        if p and p.poll() is None:
+            try:
+                # winws.exe нужен жёсткий kill — он держит kernel-ресурсы
+                subprocess.run(["taskkill", "/F", "/T", "/PID", str(p.pid)],
+                               **(_win_subprocess_kwargs() if IS_WIN else {}),
+                               timeout=5)
+            except Exception as e:
+                self.log_msg(f"taskkill: {e}")
+            try:
+                p.wait(timeout=3)
+            except Exception:
+                pass
+        self.zapret_proc = None
+        self.log_msg("zapret остановлен")
+        self._refresh_zapret_card()
+
+    def _poll_zapret(self):
+        p = getattr(self, "zapret_proc", None)
+        if p and p.poll() is None:
+            self.after(2000, self._poll_zapret)
+        elif p:
+            # упал сам по себе
+            self.zapret_proc = None
+            self.log_msg(f"zapret завершился (код {p.returncode})")
+            self._refresh_zapret_card()
+
+    def _refresh_zapret_card(self):
+        if not hasattr(self, "_zapret_btn_start"):
+            return  # Mac / нет zapret
+        running = (getattr(self, "zapret_proc", None) is not None and
+                   self.zapret_proc.poll() is None)
+        if running:
+            self._zapret_status.configure(
+                text=f"Активен (PID {self.zapret_proc.pid})", fg=COLORS["ok"])
+            self._zapret_btn_start.set_state("disabled")
+            self._zapret_btn_stop.set_state("normal")
+        else:
+            self._zapret_status.configure(text="Выключен", fg=COLORS["muted"])
+            self._zapret_btn_start.set_state("normal")
+            self._zapret_btn_stop.set_state("disabled")
 
     # ---- key management ----
 

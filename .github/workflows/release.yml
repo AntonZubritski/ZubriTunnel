@@ -45,6 +45,23 @@ jobs:
           rsrc -ico icon.ico -manifest "" -o rsrc_windows.syso
           go build -o vpn-proxy.exe .
 
+      - name: Download and unpack zapret-discord-youtube
+        shell: pwsh
+        run: |
+          $url = "https://github.com/Flowseal/zapret-discord-youtube/releases/download/1.9.8c/zapret-discord-youtube-1.9.8c.zip"
+          Invoke-WebRequest $url -OutFile zapret.zip -UseBasicParsing
+          if (-not (Test-Path zapret.zip)) { Write-Error "Failed to download zapret archive"; exit 1 }
+          Expand-Archive zapret.zip -DestinationPath zapret-tmp -Force
+          # Release structure: zapret-discord-youtube-1.9.8c/{bin,lists,...}
+          $inner = Get-ChildItem zapret-tmp -Directory | Select-Object -First 1
+          New-Item -ItemType Directory -Force -Path windows\zapret | Out-Null
+          if ($inner) {
+            Copy-Item -Recurse -Force "$($inner.FullName)\*" windows\zapret\
+          } else {
+            Copy-Item -Recurse -Force "zapret-tmp\*" windows\zapret\
+          }
+          Get-ChildItem windows\zapret\bin | Select-Object -First 5 Name
+
       - name: Bundle OpenVPN community client + Wintun (no driver install needed)
         shell: pwsh
         run: |
@@ -90,6 +107,7 @@ jobs:
                       --add-data "VERSION;." `
                       --add-binary "vpn-proxy.exe;." `
                       --add-data "openvpn;openvpn" `
+                      --add-data "zapret;zapret" `
                       gui.py
           Move-Item -Force dist\ZubriTunnel.exe .\ZubriTunnel.exe
           # Cleanup PyInstaller intermediates so they don't go in the release
@@ -112,6 +130,7 @@ jobs:
             'windows\run.ps1',
             'windows\keys',
             'windows\openvpn',
+            'windows\zapret',
             'README.md',
             'VERSION'
           )
