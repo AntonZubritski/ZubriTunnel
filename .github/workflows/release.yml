@@ -52,13 +52,18 @@ jobs:
           Invoke-WebRequest $url -OutFile zapret.zip -UseBasicParsing
           if (-not (Test-Path zapret.zip)) { Write-Error "Failed to download zapret archive"; exit 1 }
           Expand-Archive zapret.zip -DestinationPath zapret-tmp -Force
-          # Release structure: zapret-discord-youtube-1.9.8c/{bin,lists,...}
-          $inner = Get-ChildItem zapret-tmp -Directory | Select-Object -First 1
           New-Item -ItemType Directory -Force -Path windows\zapret | Out-Null
-          if ($inner) {
-            Copy-Item -Recurse -Force "$($inner.FullName)\*" windows\zapret\
-          } else {
+          # Release zip может быть либо плоским (bin\ в корне), либо обёрнутым (zapret-discord-youtube-X.Y.Z\bin\)
+          if (Test-Path "zapret-tmp\bin\winws.exe") {
             Copy-Item -Recurse -Force "zapret-tmp\*" windows\zapret\
+          } else {
+            $inner = Get-ChildItem zapret-tmp -Directory | Where-Object { Test-Path "$($_.FullName)\bin\winws.exe" } | Select-Object -First 1
+            if (-not $inner) {
+              Write-Error "Could not locate bin\winws.exe in extracted zapret archive"
+              Get-ChildItem -Recurse zapret-tmp | Select-Object -First 30 FullName
+              exit 1
+            }
+            Copy-Item -Recurse -Force "$($inner.FullName)\*" windows\zapret\
           }
           Get-ChildItem windows\zapret\bin | Select-Object -First 5 Name
 
